@@ -523,16 +523,47 @@ class ComputeNode:
 
         docker_cmd = [
             "docker", "run", "-d", "-p", f"{host_port}:{container_port}",
-            # ── Security hardening (Tier 1) ──
-            "--security-opt", "no-new-privileges",  # prevent privilege escalation
-            "--cap-drop", "ALL",                     # drop all Linux capabilities
-            "--pids-limit", "512",                    # prevent fork bombs
-            "--ulimit", "nofile=4096:8192",           # file descriptor limit
-            "--tmpfs", "/tmp:rw,size=256m",          # writable /tmp
             # ── Resource limits (Tier 2) ──
             "--memory", f"{int(session_data.get('memory_mb', 4096))}m",
             "--cpus", str(session_data.get("cpu_cores", 2.0)),
+            # ── Security hardening (Tier 1) ──
+            "--pids-limit", "512",                    # prevent fork bombs
+            "--ulimit", "nofile=4096:8192",           # file descriptor limit
+            "--tmpfs", "/tmp:rw,size=256m",          # writable /tmp
         ]
+
+        # ── Session-type-aware security ──
+        # SSH sessions need capabilities for sshd to switch users and
+        # create pseudo-terminals.  The linuxserver/openssh-server image
+        # uses s6-overlay as PID 1 which also needs certain capabilities.
+        # Jupyter and other sessions get the full hardening (cap-drop ALL).
+        session_type = session_data.get("session_type", "")
+        if session_type == "ssh":
+            docker_cmd += [
+                # SSH needs SETUID/SETGID for user switching, SYS_CHROOT for
+                # sshd's chroot, DAC_OVERRIDE for password files.
+                "--cap-drop", "ALL",
+                "--cap-add", "SETUID",
+                "--cap-add", "SETGID",
+                "--cap-add", "SYS_CHROOT",
+                "--cap-add", "DAC_OVERRIDE",
+                "--cap-add", "CHOWN",
+                "--cap-add", "FOWNER",
+                "--cap-add", "KILL",
+                "--cap-add", "NET_BIND_SERVICE",
+                # linuxserver/openssh-server env vars:
+                "-e", "PASSWORD_ACCESS=TRUE",
+                "-e", "USER_PASSWORD=poolpass",
+                "-e", "USER_NAME=root",
+                "-e", "PUID=0",
+                "-e", "PGID=0",
+            ]
+            # no-new-privileges is NOT added for SSH sessions (sshd needs setuid).
+        else:
+            docker_cmd += [
+                "--security-opt", "no-new-privileges",
+                "--cap-drop", "ALL",
+            ]
 
         # ── Network egress filtering (Tier 3) ──
         # Block known mining pool domains by redirecting them to 127.0.0.1.
