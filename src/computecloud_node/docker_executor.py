@@ -144,8 +144,17 @@ class DockerExecutor(TaskExecutor):
         command: str,
         payload: dict[str, Any] | None,
     ) -> list[str]:
-        """Assemble the full ``docker run`` argument list."""
-        args: list[str] = ["docker", "run", "--rm"]
+        """Assemble the full ``docker run`` argument list with security hardening."""
+        args: list[str] = [
+            "docker", "run", "--rm",
+            # ── Security hardening (Tier 1) ──
+            "--security-opt", "no-new-privileges",  # prevent privilege escalation
+            "--cap-drop", "ALL",                     # drop all Linux capabilities
+            "--pids-limit", "256",                    # prevent fork bombs
+            "--ulimit", "nofile=1024:4096",           # file descriptor limit
+            "--read-only",                           # read-only root filesystem
+            "--tmpfs", "/tmp:rw,size=64m",           # writable /tmp (needed since root is RO)
+        ]
 
         payload = payload or {}
         if payload.get("gpu"):

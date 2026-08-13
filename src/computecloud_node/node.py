@@ -521,7 +521,15 @@ class ComputeNode:
             s.bind(("0.0.0.0", 0))
             host_port = s.getsockname()[1]
 
-        docker_cmd = ["docker", "run", "-d", "-p", f"{host_port}:{container_port}"]
+        docker_cmd = [
+            "docker", "run", "-d", "-p", f"{host_port}:{container_port}",
+            # ── Security hardening (Tier 1) ──
+            "--security-opt", "no-new-privileges",  # prevent privilege escalation
+            "--cap-drop", "ALL",                     # drop all Linux capabilities
+            "--pids-limit", "512",                    # prevent fork bombs
+            "--ulimit", "nofile=4096:8192",           # file descriptor limit
+            "--tmpfs", "/tmp:rw,size=256m",          # writable /tmp
+        ]
         if command:
             docker_cmd += [docker_image, "/bin/sh", "-c", command]
         else:
@@ -623,17 +631,27 @@ class ComputeNode:
 
     @staticmethod
     def _stop_container(container_id: str) -> None:
-        """Stop and remove a Docker container."""
+        """Stop and remove a Docker container with secure data deletion."""
         import subprocess
 
-        for cmd in (
-            ["docker", "stop", container_id],
-            ["docker", "rm", "-f", container_id],
-        ):
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=10.0)
-            except Exception:
-                pass
+        # Stop the container.
+        try:
+            subprocess.run(
+                ["docker", "stop", container_id],
+                capture_output=True, text=True, timeout=10.0,
+            )
+        except Exception:
+            pass
+        # Remove the container and its volumes (-v) for secure data deletion.
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", "-v", container_id],
+                capture_output=True, text=True, timeout=10.0,
+            )
+            logger.info("Container %s stopped and volumes removed (secure deletion)",
+                        container_id[:12])
+        except Exception:
+            pass
 
     def _report_session_terminated(
         self, session_id: str, reason: str, message: str
