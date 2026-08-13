@@ -1,0 +1,194 @@
+"""Docker-based executor — runs task commands inside containers.
+
+This is the sandboxed counterpart to
+:class:`~computecloud_node.local_executor.LocalProcessExecutor`: instead
+of running the payload command directly on the host shell, the command is
+executed inside a Docker container built from the image named in the task
+payload.  This is what makes "template" jobs (PyTorch, TensorFlow,
+Python 3.x, ...) possible — and it keeps untrusted renter code off the
+contributor's host system.
+
+Expected task payload::
+
+    {
+        "image": "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime",
+        "command": "python -c 'import torch; print(torch.__version__)'",
+        "timeout_seconds": 300,          # optional
+        "gpu": true,                     # optional — pass --gpus all
+        "memory_mb": 4096,               # optional — container memory cap
+        "cpu_cores": 2.0                 # optional — container CPU cap
+    }
+
+If *image* is missing, the executor raises so the pool records a clear
+failure (use LocalProcessExecutor for plain shell tasks instead).
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from typing import Any
+
+from computecloud_node.executor import TaskExecutor
+from computecloud_node.local_executor import CommandResult
+
+
+class DockerExecutor(TaskExecutor):
+    """Execute tasks inside Docker containers (template jobs).
+
+    Parameters
+    ----------
+    default_timeout_seconds:
+        Timeout when the payload doesn't specify one.  Note that image
+        pulls happen within this window on first use of a template.
+    allowed_image_prefixes:
+        Optional allow-list of image-name prefixes (e.g. ``["pytorch/",
+        "python:", "tensorflow/"]``).  Empty/None = any image allowed.
+    extra_docker_args:
+        Additional ``docker run`` arguments applied to every container
+        (e.g. ``["--network", "none"]`` to disable networking).
+    """
+
+    def __init__(
+        self,
+        default_timeout_seconds: float = 600.0,
+        allowed_image_prefixes: list[str] | None = None,
+        extra_docker_args: list[str] | None = None,
+    ) -> None:
+        self.default_timeout_seconds = default_timeout_seconds
+        self.allowed_image_prefixes = allowed_image_prefixes or []
+        self.extra_docker_args = extra_docker_args or []
+
+    # ── TaskExecutor API ─────────────────────────────────────────────
+
+    def execute(
+        self,
+        task_id: str,
+        job_id: str,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Run the payload command inside the payload's Docker image."""
+        image = self._extract_image(payload)
+        command = self._extract_command(payload)
+        timeout = self._extract_timeout(payload)
+
+        docker_cmd = self._build_docker_command(image, command, payload)
+        result = self._run(docker_cmd, timeout)
+        return {
+            "image": image,
+            "command": command,
+            "return_code": result.return_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+
+    # ── Availability check ───────────────────────────────────────────
+
+    @staticmethod
+    def is_docker_available() -> bool:
+        """Return True if a working ``docker`` CLI is on PATH."""
+        if shutil.which("docker") is None:
+            return False
+        try:
+            completed = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=10,
+            )
+            return completed.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+
+    # ── Internal helpers ─────────────────────────────────────────────
+
+    def _extract_image(self, payload: dict[str, Any] | None) -> str:
+        if not payload or not payload.get("image"):
+            raise ValueError(
+                "DockerExecutor requires an 'image' key in the task payload "
+                "(e.g. 'python:3.12-slim'). Use LocalProcessExecutor for "
+                "plain shell tasks."
+            )
+        image = str(payload["image"])
+        if self.allowed_image_prefixes and not any(
+            image.startswith(p) for p in self.allowed_image_prefixes
+        ):
+            raise ValueError(
+                f"Image '{image}' is not in this node's allow-list "
+                f"({self.allowed_image_prefixes})"
+            )
+        return image
+
+    @staticmethod
+    def _extract_command(payload: dict[str, Any] | None) -> str:
+        if payload is None:
+            raise ValueError("DockerExecutor requires a task payload")
+        for key in ("command", "cmd", "shell"):
+            value = payload.get(key)
+            if value is not None:
+                if isinstance(value, (list, tuple)):
+                    return " ".join(str(v) for v in value)
+                return str(value)
+        raise ValueError("DockerExecutor: payload must contain a 'command' key")
+
+    def _extract_timeout(self, payload: dict[str, Any] | None) -> float:
+        if payload and "timeout_seconds" in payload:
+            try:
+                return float(payload["timeout_seconds"])
+            except (TypeError, ValueError):
+                pass
+        return self.default_timeout_seconds
+
+    def _build_docker_command(
+        self,
+        image: str,
+        command: str,
+        payload: dict[str, Any] | None,
+    ) -> list[str]:
+        """Assemble the full ``docker run`` argument list."""
+        args: list[str] = ["docker", "run", "--rm"]
+
+        payload = payload or {}
+        if payload.get("gpu"):
+            args += ["--gpus", "all"]
+        memory_mb = payload.get("memory_mb")
+        if memory_mb:
+            args += ["--memory", f"{int(memory_mb)}m"]
+        cpu_cores = payload.get("cpu_cores")
+        if cpu_cores:
+            args += ["--cpus", str(float(cpu_cores))]
+
+        args += self.extra_docker_args
+        # Run the command through the image's shell so pipes/&& work.
+        args += [image, "/bin/sh", "-c", command]
+        return args
+
+    def _run(self, docker_cmd: list[str], timeout: float) -> CommandResult:
+        """Execute the docker command and capture its output."""
+        try:
+            completed = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode()
+            return CommandResult(
+                return_code=-1,
+                stdout=stdout or "",
+                stderr=f"Container timed out after {timeout}s",
+            )
+        except FileNotFoundError:
+            return CommandResult(
+                return_code=-1,
+                stdout="",
+                stderr="docker CLI not found — install Docker to run template jobs",
+            )
+
+        return CommandResult(
+            return_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )

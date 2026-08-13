@@ -1,0 +1,473 @@
+"""ComputeNode - the main runtime loop for a worker node in the pool.
+
+A ComputeNode connects to a pool coordinator via gRPC or HTTP, registers itself,
+sends periodic heartbeats, polls for tasks, executes them via a
+user-supplied TaskExecutor, and reports results back to the pool.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from computecloud_node.config import NodeConfig
+from computecloud_node.executor import TaskExecutor, TaskResult
+
+logger = logging.getLogger(__name__)
+
+
+class ComputeNode:
+    """Worker node runtime that participates in the ComputeCloud pool.
+
+    Parameters
+    ----------
+    config:
+        NodeConfig with server address, capabilities, etc.
+    executor:
+        Optional TaskExecutor implementation. Can also be set later.
+    """
+
+    def __init__(
+        self,
+        config: NodeConfig,
+        executor: TaskExecutor | None = None,
+    ) -> None:
+        self.config = config
+        self._executor: TaskExecutor | None = executor
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._running = False
+        self._tasks_in_flight = 0
+        self._exec_pool: ThreadPoolExecutor | None = None
+        self._channel = None
+        self._stub = None
+        self._http_client = None
+
+    # -- Public API --
+
+    @property
+    def node_id(self) -> str:
+        """The unique identifier for this node."""
+        return self.config.node_id  # type: ignore[attr-defined]
+
+    def set_executor(self, executor: TaskExecutor) -> None:
+        """Set (or replace) the task executor implementation."""
+        with self._lock:
+            self._executor = executor
+
+    def run(self) -> None:
+        """Register with the pool, then poll-execute-report in a loop.
+
+        Blocks until :meth:`stop` is called (or SIGINT/SIGTERM received).
+        """
+        # Signal handlers can only be installed from the main thread.
+        # When run() is invoked from a background thread (embedded usage,
+        # tests), skip them — the caller controls shutdown via stop().
+        if threading.current_thread() is threading.main_thread():
+            import signal
+
+            signal.signal(signal.SIGINT, lambda *_: self.stop())
+            signal.signal(signal.SIGTERM, lambda *_: self.stop())
+
+        self._connect_and_register()
+        self._running = True
+        logger.info("ComputeNode %s started - polling for tasks",
+                     self.config.node_id)
+
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True
+        )
+        heartbeat_thread.start()
+
+        try:
+            while not self._stop_event.is_set():
+                self._poll_once()
+                self._stop_event.wait(self.config.poll_interval_seconds)
+        finally:
+            self._running = False
+            self._stop()
+
+    def stop(self) -> None:
+        """Signal the node to stop polling and shut down cleanly."""
+        self._stop_event.set()
+
+    # -- gRPC setup --
+
+    def _connect_and_register(self) -> None:
+        """Connect to the pool and register the node.
+
+        Dispatches to HTTP or gRPC transport based on ``config.use_http``.
+        """
+        if self.config.use_http:
+            import httpx
+
+            self._http_client = httpx.Client(
+                base_url=self.config.http_base_url or "http://localhost:8000",
+                timeout=30.0,
+            )
+        else:
+            self._connect_and_register_grpc()
+
+        response = self._register()
+        if not response.accepted:
+            raise RuntimeError(f"Node registration rejected: {response.message}")
+        if response.node_id:
+            self.config.node_id = response.node_id
+
+    def _connect_and_register_grpc(self) -> None:
+        """Open a gRPC channel for talking to the pool coordinator."""
+        import grpc
+
+        from computecloud_node.proto_stub import (
+            computecloud_pb2_grpc as pb2_grpc,
+        )
+
+        server_addr = f"{self.config.server_host}:{self.config.server_port}"
+        if self.config.use_tls:
+            self._channel = grpc.secure_channel(
+                server_addr,
+                grpc.ssl_channel_credentials(),
+                options=[
+                    ("grpc.ssl_target_name_override", self.config.server_host),
+                ],
+            )
+        else:
+            self._channel = grpc.insecure_channel(server_addr)
+        self._stub = pb2_grpc.NodeServiceStub(self._channel)
+
+    def _register(self):
+        """Register with the pool via HTTP or gRPC."""
+        if self.config.use_http:
+            return self._register_http()
+        return self._register_grpc()
+
+    def _register_http(self):
+        """Register via HTTP POST /api/v1/node/register."""
+        caps = self.config.capabilities
+        body: dict = {
+            "node_id": self.config.node_id or "",
+            "endpoint": self.config.endpoint or "",
+            "tags": list(self.config.tags),
+            "cpu_cores": caps.cpu_cores,
+            "memory_mb": caps.memory_mb,
+            "gpu_count": caps.gpu_count,
+            "disk_mb": caps.disk_mb,
+            "gpu_model": caps.gpu_model or "",
+            "max_concurrent_tasks": self.config.max_concurrent_tasks,
+        }
+        # If username/password are provided, include them so the server
+        # can associate this node with the user's account.
+        if self.config.username and self.config.password:
+            body["username"] = self.config.username
+            body["password"] = self.config.password
+        resp = self._http_client.post("/api/v1/node/register", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        from computecloud_node.config import NodeConfig as _NC  # noqa
+        from dataclasses import dataclass as _dc
+
+        @_dc
+        class _RegResp:
+            accepted: bool
+            node_id: str
+            message: str
+
+        return _RegResp(
+            accepted=data["accepted"],
+            node_id=data.get("node_id", ""),
+            message=data.get("message", ""),
+        )
+
+    def _register_grpc(self):
+        """Register via gRPC RegisterNode RPC."""
+        from computecloud_node.proto_stub import (
+            computecloud_pb2 as pb2,
+        )
+
+        caps = self.config.capabilities
+        resources = pb2.ResourceSpec(
+            cpu_cores=caps.cpu_cores,
+            memory_mb=caps.memory_mb,
+            gpu_count=caps.gpu_count,
+            disk_mb=caps.disk_mb,
+            gpu_model=caps.gpu_model or "",
+        )
+        node_info = pb2.NodeInfo(
+            node_id=self.config.node_id or "",
+            endpoint=self.config.endpoint or "",
+            tags=list(self.config.tags),
+            capabilities=resources,
+            max_concurrent_tasks=self.config.max_concurrent_tasks,
+        )
+        request = pb2.RegisterNodeRequest(
+            api_key=self.config.api_key or "",
+            node=node_info,
+        )
+        return self._stub.RegisterNode(request, timeout=10.0)
+
+    # -- Heartbeating --
+
+    def _heartbeat_loop(self) -> None:
+        """Background thread that sends periodic heartbeats.
+
+        If the pool responds NOT_FOUND (e.g. the coordinator restarted and
+        lost its in-memory registry), the node automatically re-registers
+        instead of erroring forever.
+        """
+        if self.config.use_http:
+            self._heartbeat_loop_http()
+        else:
+            self._heartbeat_loop_grpc()
+
+    def _heartbeat_loop_http(self) -> None:
+        """HTTP heartbeat loop."""
+        while not self._stop_event.is_set():
+            try:
+                resp = self._http_client.post(
+                    f"/api/v1/node/{self.config.node_id}/heartbeat"
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data.get("acknowledged"):
+                    logger.warning("Heartbeat not acknowledged, re-registering...")
+                    reg = self._register()
+                    if reg.accepted:
+                        logger.info("Re-registered as %s", self.config.node_id)
+            except Exception:
+                logger.exception("Heartbeat (HTTP) failed")
+            self._stop_event.wait(self.config.heartbeat_interval_seconds)
+
+    def _heartbeat_loop_grpc(self) -> None:
+        """gRPC heartbeat loop (original implementation)."""
+        import grpc
+
+        while not self._stop_event.is_set():
+            try:
+                self._send_heartbeat()
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.NOT_FOUND:
+                    logger.warning(
+                        "Pool no longer knows node %s (coordinator restart?) "
+                        "- re-registering",
+                        self.config.node_id,
+                    )
+                    try:
+                        response = self._register_grpc()
+                        if response.accepted:
+                            logger.info(
+                                "Re-registered with pool as %s",
+                                self.config.node_id,
+                            )
+                        else:
+                            logger.error(
+                                "Re-registration rejected: %s", response.message
+                            )
+                    except Exception:
+                        logger.exception("Re-registration failed")
+                else:
+                    logger.exception("Heartbeat failed")
+            except Exception:
+                logger.exception("Heartbeat failed")
+            self._stop_event.wait(self.config.heartbeat_interval_seconds)
+
+    def _send_heartbeat(self) -> None:
+        """Send a single Heartbeat RPC to the pool."""
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        from computecloud_node.proto_stub.computecloud_pb2 import (
+            HeartbeatRequest,
+        )
+
+        ts = Timestamp()
+        ts.GetCurrentTime()
+        self._stub.Heartbeat(
+            HeartbeatRequest(
+                node_id=self.config.node_id,
+                timestamp=ts,
+            ),
+            timeout=5.0,
+        )
+
+    # -- Task polling --
+
+    def _poll_once(self) -> None:
+        """Pull one task and dispatch it to the executor thread pool."""
+        if self._tasks_in_flight >= self.config.max_concurrent_tasks:
+            return
+
+        if self.config.use_http:
+            self._poll_once_http()
+        else:
+            self._poll_once_grpc()
+
+    def _poll_once_http(self) -> None:
+        """Pull a task via HTTP POST /api/v1/node/{node_id}/pull."""
+        try:
+            resp = self._http_client.post(
+                f"/api/v1/node/{self.config.node_id}/pull"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.exception("PullTask (HTTP) failed")
+            return
+
+        if not data.get("has_task"):
+            return
+
+        with self._lock:
+            self._tasks_in_flight += 1
+
+        if self._exec_pool is None:
+            self._exec_pool = ThreadPoolExecutor(
+                max_workers=self.config.max_concurrent_tasks,
+                thread_name_prefix="exec",
+            )
+
+        self._exec_pool.submit(self._execute_task, data)
+
+    def _poll_once_grpc(self) -> None:
+        """Pull a task via gRPC (original implementation)."""
+        from computecloud_node.proto_stub.computecloud_pb2 import (
+            PullTaskRequest,
+        )
+
+        try:
+            response = self._stub.PullTask(
+                PullTaskRequest(node_id=self.config.node_id),
+                timeout=5.0,
+            )
+        except Exception:
+            logger.exception("PullTask RPC failed")
+            return
+
+        if not response.has_task:
+            return
+
+        task = response.task
+        with self._lock:
+            self._tasks_in_flight += 1
+
+        if self._exec_pool is None:
+            self._exec_pool = ThreadPoolExecutor(
+                max_workers=self.config.max_concurrent_tasks,
+                thread_name_prefix="exec",
+            )
+
+        self._exec_pool.submit(self._execute_task, task)
+
+    def _execute_task(self, task) -> None:
+        """Execute a single pulled task and report the outcome.
+
+        ``task`` is either a dict (HTTP mode) or a proto TaskAssignment (gRPC).
+        """
+        import time as _time
+
+        start = _time.monotonic()
+        executor = self._executor
+        result: TaskResult
+
+        # Extract fields from either a dict (HTTP) or proto (gRPC) task object.
+        if isinstance(task, dict):
+            task_id = task.get("task_id", "")
+            job_id = task.get("job_id", "")
+            payload = task.get("payload")
+        else:
+            task_id = task.task_id
+            job_id = task.job_id
+            payload = None
+            if task.payload and task.payload.fields:
+                from google.protobuf.json_format import MessageToDict
+
+                payload = MessageToDict(task.payload)
+
+        if executor is None:
+            result = TaskResult(
+                success=False,
+                error="No executor set - call set_executor() before running.",
+                execution_time_seconds=_time.monotonic() - start,
+            )
+        else:
+            try:
+                outcome = executor.execute(
+                    task_id=task_id,
+                    job_id=job_id,
+                    payload=payload,
+                )
+                result = TaskResult(
+                    success=True,
+                    result=outcome,
+                    execution_time_seconds=_time.monotonic() - start,
+                )
+            except Exception as exc:
+                logger.exception("Task %s failed", task_id)
+                result = TaskResult(
+                    success=False,
+                    error=str(exc),
+                    execution_time_seconds=_time.monotonic() - start,
+                )
+
+        self._report_result(task_id, result)
+
+        with self._lock:
+            self._tasks_in_flight -= 1
+
+    def _report_result(self, task_id: str, result: TaskResult) -> None:
+        """Send a task result to the pool via HTTP or gRPC."""
+        if self.config.use_http:
+            self._report_result_http(task_id, result)
+        else:
+            self._report_result_grpc(task_id, result)
+
+    def _report_result_http(self, task_id: str, result: TaskResult) -> None:
+        """Send a task result via HTTP POST /api/v1/node/{node_id}/result."""
+        body = {
+            "node_id": self.config.node_id,
+            "task_id": task_id,
+            "success": result.success,
+            "error": result.error,
+            "result": result.result,
+            "execution_time_seconds": result.execution_time_seconds,
+        }
+        resp = self._http_client.post(
+            f"/api/v1/node/{self.config.node_id}/result", json=body
+        )
+        resp.raise_for_status()
+
+    def _report_result_grpc(self, task_id: str, result: TaskResult) -> None:
+        """Send a ReportResult RPC for a completed task."""
+        from computecloud_node.proto_stub.computecloud_pb2 import (
+            ReportResultRequest,
+        )
+        from computecloud_node.proto_stub.computecloud_pb2 import (
+            TaskResult as PbTaskResult,
+        )
+
+        proto_result = PbTaskResult(
+            task_id=task_id,
+            success=result.success,
+            error=result.error or "",
+        )
+        if result.result:
+            proto_result.result.update(result.result)
+
+        self._stub.ReportResult(
+            ReportResultRequest(
+                node_id=self.config.node_id,
+                result=proto_result,
+            ),
+            timeout=10.0,
+        )
+
+    # -- Shutdown --
+
+    def _stop(self) -> None:
+        """Clean up resources - channel/client and executor pool."""
+        if self._exec_pool is not None:
+            self._exec_pool.shutdown(wait=True)
+            self._exec_pool = None
+        if self._channel is not None:
+            self._channel.close()
+        if self._http_client is not None:
+            self._http_client.close()
