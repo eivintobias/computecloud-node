@@ -43,6 +43,7 @@ class ComputeNode:
         self._channel = None
         self._stub = None
         self._http_client = None
+        self._active_sessions: dict[str, str] = {}  # session_id -> container_id
 
     # -- Public API --
 
@@ -83,6 +84,7 @@ class ComputeNode:
         try:
             while not self._stop_event.is_set():
                 self._poll_once()
+                self._session_poll_once()
                 self._stop_event.wait(self.config.poll_interval_seconds)
         finally:
             self._running = False
@@ -471,3 +473,182 @@ class ComputeNode:
             self._channel.close()
         if self._http_client is not None:
             self._http_client.close()
+
+    # -- Session lifecycle (HTTP only) --
+
+    def _session_poll_once(self) -> None:
+        """Pull a session assignment from the pool (HTTP only)."""
+        if not self.config.use_http:
+            return
+        try:
+            resp = self._http_client.post(
+                f"/api/v1/node/{self.config.node_id}/session/pull"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            return
+
+        if not data.get("has_session"):
+            return
+
+        session_id = data.get("session_id", "")
+        if session_id in self._active_sessions:
+            return
+
+        thread = threading.Thread(
+            target=self._run_session_container,
+            args=(data,),
+            daemon=True,
+            name=f"session-{session_id[:8]}",
+        )
+        thread.start()
+
+    def _run_session_container(self, session_data: dict) -> None:
+        """Start a Docker container for a session and keep it alive."""
+        import secrets as _secrets
+        import socket as _socket
+        import subprocess
+        import time as _time
+
+        session_id = session_data["session_id"]
+        docker_image = session_data["docker_image"]
+        command = session_data["command"]
+        container_port = session_data["container_port"]
+        auth_token = _secrets.token_urlsafe(12)
+
+        with _socket.socket() as s:
+            s.bind(("0.0.0.0", 0))
+            host_port = s.getsockname()[1]
+
+        docker_cmd = ["docker", "run", "-d", "-p", f"{host_port}:{container_port}"]
+        if command:
+            docker_cmd += [docker_image, "/bin/sh", "-c", command]
+        else:
+            docker_cmd += [docker_image]
+
+        try:
+            result = subprocess.run(
+                docker_cmd, capture_output=True, text=True, timeout=120.0
+            )
+            if result.returncode != 0:
+                logger.error(
+                    "docker run failed for session %s: %s",
+                    session_id[:8], result.stderr,
+                )
+                self._report_session_terminated(
+                    session_id, "failed", f"docker run failed: {result.stderr}"
+                )
+                return
+            container_id = result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            self._report_session_terminated(session_id, "failed", "docker run timed out")
+            return
+        except FileNotFoundError:
+            self._report_session_terminated(session_id, "failed", "docker CLI not found")
+            return
+
+        self._active_sessions[session_id] = container_id
+
+        deadline = _time.monotonic() + 60.0
+        ready = False
+        while _time.monotonic() < deadline:
+            try:
+                with _socket.socket() as s:
+                    s.settimeout(1.0)
+                    s.connect(("127.0.0.1", host_port))
+                    ready = True
+                    break
+            except OSError:
+                _time.sleep(0.5)
+
+        if not ready:
+            self._stop_container(container_id)
+            self._report_session_terminated(
+                session_id, "failed", "Container port never opened"
+            )
+            return
+
+        try:
+            resp = self._http_client.post(
+                f"/api/v1/node/{self.config.node_id}/session/ready",
+                json={
+                    "session_id": session_id,
+                    "host_port": host_port,
+                    "auth_token": auth_token,
+                },
+            )
+            resp.raise_for_status()
+        except Exception:
+            self._stop_container(container_id)
+            self._report_session_terminated(session_id, "failed", "report ready failed")
+            return
+
+        logger.info("Session %s ready on port %d", session_id[:8], host_port)
+
+        while not self._stop_event.is_set():
+            try:
+                resp = self._http_client.post(
+                    f"/api/v1/node/{self.config.node_id}/session/heartbeat",
+                    json={"session_id": session_id},
+                )
+                resp.raise_for_status()
+                hb = resp.json()
+                if hb.get("should_terminate"):
+                    break
+            except Exception:
+                logger.exception("Session heartbeat failed for %s", session_id[:8])
+
+            try:
+                inspect = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+                    capture_output=True, text=True, timeout=5.0,
+                )
+                if inspect.returncode != 0 or inspect.stdout.strip() != "true":
+                    self._report_session_terminated(
+                        session_id, "completed", "Container exited"
+                    )
+                    self._active_sessions.pop(session_id, None)
+                    return
+            except Exception:
+                pass
+
+            self._stop_event.wait(10.0)
+
+        self._stop_container(container_id)
+        self._report_session_terminated(
+            session_id, "completed", "Terminated by renter"
+        )
+        self._active_sessions.pop(session_id, None)
+
+    @staticmethod
+    def _stop_container(container_id: str) -> None:
+        """Stop and remove a Docker container."""
+        import subprocess
+
+        for cmd in (
+            ["docker", "stop", container_id],
+            ["docker", "rm", "-f", container_id],
+        ):
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=10.0)
+            except Exception:
+                pass
+
+    def _report_session_terminated(
+        self, session_id: str, reason: str, message: str
+    ) -> None:
+        """Tell the server that a session container has stopped."""
+        try:
+            self._http_client.post(
+                f"/api/v1/node/{self.config.node_id}/session/terminated",
+                json={
+                    "session_id": session_id,
+                    "reason": reason,
+                    "message": message,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to report session terminated for %s", session_id[:8]
+            )
