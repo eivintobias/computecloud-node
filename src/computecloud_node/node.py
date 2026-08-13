@@ -533,6 +533,13 @@ class ComputeNode:
             "--memory", f"{int(session_data.get('memory_mb', 4096))}m",
             "--cpus", str(session_data.get("cpu_cores", 2.0)),
         ]
+
+        # ── Network egress filtering (Tier 3) ──
+        # Block known mining pool domains by redirecting them to 127.0.0.1.
+        from computecloud_node.security_monitor import KNOWN_MINING_POOL_DOMAINS
+        for domain in KNOWN_MINING_POOL_DOMAINS:
+            docker_cmd += ["--add-host", f"{domain}:127.0.0.1"]
+
         if command:
             docker_cmd += [docker_image, "/bin/sh", "-c", command]
         else:
@@ -609,6 +616,15 @@ class ComputeNode:
         )
         tunnel_thread.start()
 
+        # ── Security monitor (Tier 3) ──
+        from computecloud_node.security_monitor import SecurityMonitor
+        security_monitor = SecurityMonitor(
+            cpu_threshold_percent=95.0,
+            sustained_checks=10,
+        )
+        security_scan_interval = 60.0  # seconds
+        last_scan_time = _time.monotonic()
+
         while not self._stop_event.is_set():
             try:
                 resp = self._http_client.post(
@@ -635,6 +651,25 @@ class ComputeNode:
                     return
             except Exception:
                 pass
+
+            # ── Security scan (Tier 3) ──
+            now = _time.monotonic()
+            if now - last_scan_time >= security_scan_interval:
+                last_scan_time = now
+                alert = security_monitor.scan_container(container_id)
+                if alert is not None:
+                    logger.warning(
+                        "Security alert for session %s: %s — %s",
+                        session_id[:8], alert.alert_type, alert.details,
+                    )
+                    self._report_security_alert(session_id, alert)
+                    if alert.severity == "critical":
+                        self._stop_container(container_id)
+                        self._report_session_terminated(
+                            session_id, alert.alert_type, alert.details,
+                        )
+                        self._active_sessions.pop(session_id, None)
+                        return
 
             self._stop_event.wait(10.0)
 
@@ -777,3 +812,20 @@ class ComputeNode:
             logger.exception(
                 "Failed to report session terminated for %s", session_id[:8]
             )
+
+    def _report_security_alert(self, session_id: str, alert) -> None:
+        """Report a security alert to the server (Tier 3)."""
+        try:
+            self._http_client.post(
+                f"/api/v1/node/{self.config.node_id}/security/alert",
+                json={
+                    "session_id": session_id,
+                    "alert_type": alert.alert_type,
+                    "severity": alert.severity,
+                    "details": alert.details,
+                    "process_names": alert.process_names,
+                    "cpu_percent": alert.cpu_percent,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to report security alert for %s", session_id[:8])
