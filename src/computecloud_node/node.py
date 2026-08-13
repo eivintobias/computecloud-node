@@ -57,6 +57,52 @@ class ComputeNode:
         with self._lock:
             self._executor = executor
 
+    @staticmethod
+    def _find_docker() -> str:
+        """Resolve the full path to the Docker CLI executable.
+
+        On Windows, Docker Desktop installs docker.exe in a per-user
+        directory that may not be on the PATH when Python spawns
+        subprocesses.  We search common install locations as a fallback.
+
+        Returns the full path to docker.exe (Windows) or 'docker'
+        (Linux/macOS, where it's always on PATH).
+        """
+        import os
+        import shutil
+        import sys
+
+        # On non-Windows, just use 'docker' (always on PATH).
+        if sys.platform != "win32":
+            return "docker"
+
+        # First try the standard PATH lookup.
+        path = shutil.which("docker")
+        if path:
+            return path
+
+        # Docker Desktop common install locations (per-user and system-wide).
+        candidates = [
+            os.path.join(
+                os.environ.get("LOCALAPPDATA", ""),
+                "Programs", "DockerDesktop", "resources", "bin", "docker.exe",
+            ),
+            os.path.join(
+                os.environ.get("ProgramFiles", ""),
+                "Docker", "Docker", "resources", "bin", "docker.exe",
+            ),
+            os.path.join(
+                os.environ.get("ProgramFiles(x86)", ""),
+                "Docker", "Docker", "resources", "bin", "docker.exe",
+            ),
+        ]
+        for c in candidates:
+            if c and os.path.isfile(c):
+                return c
+
+        # Last resort: just use 'docker' and let it fail with a clear error.
+        return "docker"
+
     def run(self) -> None:
         """Register with the pool, then poll-execute-report in a loop.
 
@@ -522,7 +568,7 @@ class ComputeNode:
             host_port = s.getsockname()[1]
 
         docker_cmd = [
-            "docker", "run", "-d", "-p", f"{host_port}:{container_port}",
+            self._find_docker(), "run", "-d", "-p", f"{host_port}:{container_port}",
             # ── Resource limits (Tier 2) ──
             "--memory", f"{int(session_data.get('memory_mb', 4096))}m",
             "--cpus", str(session_data.get("cpu_cores", 2.0)),
@@ -671,7 +717,7 @@ class ComputeNode:
 
             try:
                 inspect = subprocess.run(
-                    ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+                    [self._find_docker(), "inspect", "-f", "{{.State.Running}}", container_id],
                     capture_output=True, text=True, timeout=5.0,
                 )
                 if inspect.returncode != 0 or inspect.stdout.strip() != "true":
@@ -807,10 +853,12 @@ class ComputeNode:
         """Stop and remove a Docker container with secure data deletion."""
         import subprocess
 
+        docker_bin = ComputeNode._find_docker()
+
         # Stop the container.
         try:
             subprocess.run(
-                ["docker", "stop", container_id],
+                [docker_bin, "stop", container_id],
                 capture_output=True, text=True, timeout=10.0,
             )
         except Exception:
@@ -818,7 +866,7 @@ class ComputeNode:
         # Remove the container and its volumes (-v) for secure data deletion.
         try:
             subprocess.run(
-                ["docker", "rm", "-f", "-v", container_id],
+                [docker_bin, "rm", "-f", "-v", container_id],
                 capture_output=True, text=True, timeout=10.0,
             )
             logger.info("Container %s stopped and volumes removed (secure deletion)",

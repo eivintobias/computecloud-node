@@ -25,12 +25,42 @@ failure (use LocalProcessExecutor for plain shell tasks instead).
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from typing import Any
 
 from computecloud_node.executor import TaskExecutor
 from computecloud_node.local_executor import CommandResult
+
+
+def _find_docker() -> str:
+    """Resolve the full path to the Docker CLI executable.
+
+    On Windows, Docker Desktop installs docker.exe in a per-user
+    directory that may not be on the PATH when Python spawns
+    subprocesses.  We search common install locations as a fallback.
+    """
+    if sys.platform != "win32":
+        return "docker"
+    path = shutil.which("docker")
+    if path:
+        return path
+    candidates = [
+        os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Programs", "DockerDesktop", "resources", "bin", "docker.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles", ""),
+            "Docker", "Docker", "resources", "bin", "docker.exe",
+        ),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return "docker"
 
 
 class DockerExecutor(TaskExecutor):
@@ -87,11 +117,12 @@ class DockerExecutor(TaskExecutor):
     @staticmethod
     def is_docker_available() -> bool:
         """Return True if a working ``docker`` CLI is on PATH."""
-        if shutil.which("docker") is None:
+        docker_bin = _find_docker()
+        if docker_bin == "docker" and shutil.which("docker") is None:
             return False
         try:
             completed = subprocess.run(
-                ["docker", "info"],
+                [docker_bin, "info"],
                 capture_output=True,
                 timeout=10,
             )
@@ -146,7 +177,7 @@ class DockerExecutor(TaskExecutor):
     ) -> list[str]:
         """Assemble the full ``docker run`` argument list with security hardening."""
         args: list[str] = [
-            "docker", "run", "--rm",
+            _find_docker(), "run", "--rm",
             # ── Security hardening (Tier 1) ──
             "--security-opt", "no-new-privileges",  # prevent privilege escalation
             "--cap-drop", "ALL",                     # drop all Linux capabilities
