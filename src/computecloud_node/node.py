@@ -529,6 +529,9 @@ class ComputeNode:
             "--pids-limit", "512",                    # prevent fork bombs
             "--ulimit", "nofile=4096:8192",           # file descriptor limit
             "--tmpfs", "/tmp:rw,size=256m",          # writable /tmp
+            # ── Resource limits (Tier 2) ──
+            "--memory", f"{int(session_data.get('memory_mb', 4096))}m",
+            "--cpus", str(session_data.get("cpu_cores", 2.0)),
         ]
         if command:
             docker_cmd += [docker_image, "/bin/sh", "-c", command]
