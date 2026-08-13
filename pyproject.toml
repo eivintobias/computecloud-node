@@ -12,6 +12,7 @@ authors = [{ name = "Eivin Tobias Mogård", email = "eivin@computecloud.dev" }]
 keywords = ["distributed-compute", "marketplace", "compute-pool", "contributor"]
 dependencies = [
     "httpx>=0.27",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]

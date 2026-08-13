@@ -597,6 +597,18 @@ class ComputeNode:
 
         logger.info("Session %s ready on port %d", session_id[:8], host_port)
 
+        # ── Start the WebSocket reverse-tunnel (NAT-proof relay) ──
+        # The node opens a persistent outbound WebSocket to the server,
+        # which passes through NAT/firewalls.  The server pipes the
+        # renter's traffic through this tunnel.
+        tunnel_thread = threading.Thread(
+            target=self._run_tunnel,
+            args=(session_id, host_port),
+            daemon=True,
+            name=f"tunnel-{session_id[:8]}",
+        )
+        tunnel_thread.start()
+
         while not self._stop_event.is_set():
             try:
                 resp = self._http_client.post(
@@ -631,6 +643,98 @@ class ComputeNode:
             session_id, "completed", "Terminated by renter"
         )
         self._active_sessions.pop(session_id, None)
+
+    def _run_tunnel(self, session_id: str, host_port: int) -> None:
+        """Run a WebSocket reverse-tunnel to the server (NAT-proof).
+
+        The node opens a persistent WebSocket to the server at
+        /api/v1/nodes/{node_id}/tunnel/{session_id}.  Data from the
+        server WebSocket is forwarded to the local Docker container via
+        TCP, and data from the container is sent back through the WS.
+        """
+        import asyncio
+
+        # Build the WebSocket URL from the HTTP base URL.
+        base_url = str(self._http_client.base_url).rstrip("/")
+        if base_url.startswith("https://"):
+            ws_url = "wss://" + base_url[len("https://"):]
+        elif base_url.startswith("http://"):
+            ws_url = "ws://" + base_url[len("http://"):]
+        else:
+            ws_url = "ws://" + base_url
+
+        tunnel_path = f"/api/v1/node/{self.config.node_id}/tunnel/{session_id}"
+        ws_full_url = ws_url + tunnel_path
+
+        async def _tunnel_async():
+            import websockets
+
+            logger.info("Starting tunnel for session %s → %s", session_id[:8], ws_full_url)
+
+            # Reconnect loop (in case the connection drops).
+            while not self._stop_event.is_set():
+                try:
+                    async with websockets.connect(
+                        ws_full_url,
+                        ping_interval=20,
+                        ping_timeout=10,
+                        close_timeout=5,
+                        max_size=2**24,  # 16 MB max message
+                    ) as ws:
+                        logger.info("Tunnel connected for session %s", session_id[:8])
+
+                        # Connect to the local container port.
+                        try:
+                            reader, writer = await asyncio.open_connection(
+                                "127.0.0.1", host_port
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Cannot connect to container port %d for session %s",
+                                host_port, session_id[:8],
+                            )
+                            return
+
+                        async def ws_to_tcp():
+                            """Server → WebSocket → container TCP."""
+                            try:
+                                while True:
+                                    data = await ws.recv()
+                                    writer.write(
+                                        data if isinstance(data, bytes) else data.encode()
+                                    )
+                                    await writer.drain()
+                            except Exception:
+                                pass
+                            finally:
+                                writer.close()
+
+                        async def tcp_to_ws():
+                            """Container TCP → WebSocket → server."""
+                            try:
+                                while True:
+                                    data = await reader.read(4096)
+                                    if not data:
+                                        break
+                                    await ws.send(data)
+                            except Exception:
+                                pass
+
+                        await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+
+                except Exception as exc:
+                    if not self._stop_event.is_set():
+                        logger.warning(
+                            "Tunnel for session %s disconnected: %s, reconnecting...",
+                            session_id[:8], exc,
+                        )
+                        import time as _time
+                        _time.sleep(2.0)  # backoff before reconnect
+
+        try:
+            asyncio.run(_tunnel_async())
+        except Exception:
+            logger.exception("Tunnel coroutine crashed for session %s", session_id[:8])
 
     @staticmethod
     def _stop_container(container_id: str) -> None:
