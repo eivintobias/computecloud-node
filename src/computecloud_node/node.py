@@ -568,7 +568,7 @@ class ComputeNode:
 
         self._active_sessions[session_id] = container_id
 
-        deadline = _time.monotonic() + 60.0
+        deadline = _time.monotonic() + 180.0
         ready = False
         while _time.monotonic() < deadline:
             try:
