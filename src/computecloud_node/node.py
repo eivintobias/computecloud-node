@@ -757,6 +757,25 @@ class ComputeNode:
                 "chmod +x /usr/local/bin/pool-push 2>/dev/null || true"
             )
 
+            # ── Phase 17c: welcome notebook for Jupyter workbench doors ──
+            # Drop a starter notebook (welcome.ipynb) into /workspace so the
+            # user lands in a ready-to-go environment with the Pool SDK
+            # pre-authenticated.  Skip if the file already exists (preserves
+            # user customisations).  The notebook JSON is base64-encoded to
+            # survive shell quoting inside the heredoc.
+            if session_type == "jupyter" and workspace_block:
+                import base64 as _b64
+
+                from computecloud_node.notebook_bootstrap import WELCOME_NOTEBOOK_JSON
+
+                nb_b64 = _b64.b64encode(WELCOME_NOTEBOOK_JSON.encode()).decode()
+                startup_parts.append(
+                    f"test -f /workspace/welcome.ipynb || "
+                    f"(mkdir -p /workspace && "
+                    f"echo '{nb_b64}' | base64 -d > /workspace/welcome.ipynb) "
+                    f"2>/dev/null || true"
+                )
+
         # ── SSH public-key injection (Phase 17b) ──
         if session_type == "ssh" and ssh_public_keys:
             # Inject public keys into authorized_keys via a startup script.

@@ -3,6 +3,17 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.1
+
+- **Notebook door support (Phase 17c)**: the node now drops a starter
+  `welcome.ipynb` into `/workspace` when a Jupyter workbench session starts.
+  The notebook contains a markdown intro + pre-filled cells demonstrating
+  `pool.status()`, `pool.map()`, `pool.run()`, and `pool.generate()` — all
+  using the pre-authenticated Pool SDK (env vars injected by Phase 17b).
+- **Jupyter root dir = /workspace**: the Jupyter session templates now set
+  `--ServerApp.root_dir=/workspace` so the workspace is the notebook's file
+  root (files you create are saved to your workspace).
+
 ## What's New in v0.6.0
 
 - **Workbench door support (Phase 17b)**: the node now supports
