@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "computecloud-node"
-version = "0.3.0"
+version = "0.4.0"
 description = "ComputeCloud contributor node client — share your compute with the pool"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

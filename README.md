@@ -3,6 +3,25 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.4.0
+
+- **Universal data-fabric shard participation**: nodes now automatically
+  handle generalized data-run shard tasks — not just LLM pipeline shards. When
+  the pool coordinator assigns a `data_shard` or `data_merge` task (from any
+  registered workload type — rendering, batch processing, command chunks, model
+  sharding, etc.), the node polls the server's data endpoint for its input,
+  executes the shard, and posts the output back — all through the existing
+  HTTP pull/report loop (no new connections, NAT-proof by construction).
+  Supports all three topologies: **parallel** (independent shards), **pipeline**
+  (sequential shards, output feeds next input), and **reduce** (shards + merge).
+- **Same routing as the in-repo client**: a single `DataShardAwareExecutor`
+  routes data shards → `DataShardWorker`, pipeline shards →
+  `PipelineShardWorker`, and plain tasks → your configured executor. Pipeline
+  participation from v0.3.0 keeps working unchanged.
+- Data-fabric participation is **enabled by default** in HTTP mode. No extra
+  flags needed — just start the node and it will accept data shards, pipeline
+  shards, and regular compute tasks alike.
+
 ## What's New in v0.3.0
 
 - **Distributed pipeline participation**: nodes now automatically handle

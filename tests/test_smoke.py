@@ -38,12 +38,28 @@ class TestPackageImports:
         LocalPipelineRunner()
         ShardAwareExecutor.__init__  # noqa: B018 — just check it exists
 
+    def test_import_data_worker_classes(self):
+        from computecloud_node import (
+            DATA_MERGE_KIND,
+            DATA_SHARD_KIND,
+            DataShardAwareExecutor,
+            DataShardWorker,
+            is_data_shard_task,
+        )
+
+        assert callable(is_data_shard_task)
+        assert DATA_SHARD_KIND == "data_shard"
+        assert DATA_MERGE_KIND == "data_merge"
+        DataShardAwareExecutor.__init__  # noqa: B018 — just check it exists
+
     def test_import_individual_modules(self):
         """Each module should be importable independently."""
+        import computecloud_node.data_worker
         import computecloud_node.pipeline_executor
         import computecloud_node.pipeline_worker
         import computecloud_node.shard_executor_adapter
 
+        assert computecloud_node.data_worker is not None
         assert computecloud_node.pipeline_executor is not None
         assert computecloud_node.pipeline_worker is not None
         assert computecloud_node.shard_executor_adapter is not None
@@ -73,6 +89,11 @@ class TestPackageImports:
             "PipelineShardWorker",
             "ShardAwareExecutor",
             "is_shard_task",
+            "DataShardWorker",
+            "DataShardAwareExecutor",
+            "is_data_shard_task",
+            "DATA_SHARD_KIND",
+            "DATA_MERGE_KIND",
         }
         actual = set(computecloud_node.__all__)
         assert expected <= actual, f"Missing exports: {expected - actual}"

@@ -40,6 +40,7 @@ class ComputeNode:
         self._base_executor: TaskExecutor | None = executor
         self._enable_pipeline = enable_pipeline
         self._shard_worker = None
+        self._data_worker = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._running = False
@@ -163,21 +164,29 @@ class ComputeNode:
         else:
             self._connect_and_register_grpc()
 
-        # Wrap the user-supplied executor with shard-awareness so this node
-        # can serve distributed-LLM pipeline shard tasks (Phase 12).  The
-        # ShardAwareExecutor routes ``pipeline_shard`` payloads to a
-        # PipelineShardWorker (which polls/posts via this node's HTTP client)
-        # and delegates everything else to the original fallback executor.
-        # Only enabled in HTTP mode (the standalone client's default) and only
-        # when a base executor is configured.
+        # Wrap the user-supplied executor with data-shard-awareness so this node
+        # can serve generalized data-run shards (Phase 14b / v0.4.0) AND legacy
+        # distributed-LLM pipeline shard tasks (Phase 12 / v0.3.0).  The
+        # DataShardAwareExecutor supersedes ShardAwareExecutor: it routes
+        # ``data_shard`` / ``data_merge`` payloads to a DataShardWorker,
+        # ``pipeline_shard`` payloads to a PipelineShardWorker, and delegates
+        # everything else to the original fallback executor.  Both workers
+        # poll/post via this node's HTTP client.  Only enabled in HTTP mode
+        # (the standalone client's default) and only when a base executor is
+        # configured.
         if self._enable_pipeline and self._http_client is not None:
+            from computecloud_node.data_worker import (
+                DataShardAwareExecutor,
+                DataShardWorker,
+            )
             from computecloud_node.pipeline_worker import PipelineShardWorker
-            from computecloud_node.shard_executor_adapter import ShardAwareExecutor
 
             with self._lock:
+                self._data_worker = DataShardWorker(self._http_client)
                 self._shard_worker = PipelineShardWorker(self._http_client)
-                self._executor = ShardAwareExecutor(
-                    self._shard_worker,
+                self._executor = DataShardAwareExecutor(
+                    self._data_worker,
+                    pipeline_worker=self._shard_worker,
                     fallback=self._base_executor,
                 )
 

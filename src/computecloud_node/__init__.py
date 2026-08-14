@@ -11,6 +11,8 @@ Public API:
     PipelineShardExecutor  Toy shard executor (deterministic, no ML libs).
     PipelineShardWorker    Node-side worker for distributed pipeline shards.
     ShardAwareExecutor     Adapter that routes shard tasks to the worker.
+    DataShardWorker        Node-side worker for generalized data-run shards.
+    DataShardAwareExecutor Universal router: data shards, pipeline shards, plain tasks.
 
 Quick start::
 
@@ -33,6 +35,13 @@ from __future__ import annotations
 from computecloud_node.config import (
     NodeCapabilities,
     NodeConfig,
+)
+from computecloud_node.data_worker import (
+    DATA_MERGE_KIND,
+    DATA_SHARD_KIND,
+    DataShardAwareExecutor,
+    DataShardWorker,
+    is_data_shard_task,
 )
 from computecloud_node.docker_executor import DockerExecutor
 from computecloud_node.executor import (
@@ -65,4 +74,10 @@ __all__ = [
     "PipelineShardWorker",
     "ShardAwareExecutor",
     "is_shard_task",
+    # Generalized data shard worker -- Phase 13c (ported v0.4.0)
+    "DataShardWorker",
+    "DataShardAwareExecutor",
+    "is_data_shard_task",
+    "DATA_SHARD_KIND",
+    "DATA_MERGE_KIND",
 ]
