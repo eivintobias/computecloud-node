@@ -206,6 +206,14 @@ def main(argv: list[str] | None = None) -> int:
         help="GPU model to advertise (e.g. 'RTX 4090')",
     )
     parser.add_argument(
+        "--vram",
+        type=int,
+        default=int(os.environ.get("COMPUTECLOUD_VRAM_MB", "0")),
+        help="GPU VRAM to contribute in MB for distributed LLM pipeline "
+        "participation (e.g. --vram 24000 for a 24 GB GPU). Default: 0 "
+        "(no VRAM contribution). Requires --gpu >= 1 on the server side.",
+    )
+    parser.add_argument(
         "--disk",
         type=int,
         default=None,
@@ -249,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             gpu_count=args.gpu,
             disk_mb=disk_mb,
             gpu_model=args.gpu_model,
+            vram_mb=args.vram,
         ),
         max_concurrent_tasks=args.max_tasks,
         use_tls=args.tls,

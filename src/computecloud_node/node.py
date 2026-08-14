@@ -32,9 +32,14 @@ class ComputeNode:
         self,
         config: NodeConfig,
         executor: TaskExecutor | None = None,
+        *,
+        enable_pipeline: bool = True,
     ) -> None:
         self.config = config
         self._executor: TaskExecutor | None = executor
+        self._base_executor: TaskExecutor | None = executor
+        self._enable_pipeline = enable_pipeline
+        self._shard_worker = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._running = False
@@ -56,6 +61,7 @@ class ComputeNode:
         """Set (or replace) the task executor implementation."""
         with self._lock:
             self._executor = executor
+            self._base_executor = executor
 
     @staticmethod
     def _find_docker() -> str:
@@ -157,6 +163,24 @@ class ComputeNode:
         else:
             self._connect_and_register_grpc()
 
+        # Wrap the user-supplied executor with shard-awareness so this node
+        # can serve distributed-LLM pipeline shard tasks (Phase 12).  The
+        # ShardAwareExecutor routes ``pipeline_shard`` payloads to a
+        # PipelineShardWorker (which polls/posts via this node's HTTP client)
+        # and delegates everything else to the original fallback executor.
+        # Only enabled in HTTP mode (the standalone client's default) and only
+        # when a base executor is configured.
+        if self._enable_pipeline and self._http_client is not None:
+            from computecloud_node.pipeline_worker import PipelineShardWorker
+            from computecloud_node.shard_executor_adapter import ShardAwareExecutor
+
+            with self._lock:
+                self._shard_worker = PipelineShardWorker(self._http_client)
+                self._executor = ShardAwareExecutor(
+                    self._shard_worker,
+                    fallback=self._base_executor,
+                )
+
         response = self._register()
         if not response.accepted:
             raise RuntimeError(f"Node registration rejected: {response.message}")
@@ -203,6 +227,10 @@ class ComputeNode:
             "disk_mb": caps.disk_mb,
             "gpu_model": caps.gpu_model or "",
             "max_concurrent_tasks": self.config.max_concurrent_tasks,
+            # Phase 12 — report per-GPU VRAM so the server can register a
+            # VRAMPool segment for distributed LLM pipeline participation.
+            # Defaults to 0 (backward compatible with servers that ignore it).
+            "vram_mb": caps.vram_mb,
         }
         # If username/password are provided, include them so the server
         # can associate this node with the user's account.

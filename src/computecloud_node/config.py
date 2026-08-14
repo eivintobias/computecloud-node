@@ -25,6 +25,10 @@ class NodeCapabilities:
     gpu_count: int = 0
     disk_mb: int = 8192
     gpu_model: str | None = None
+    # Phase 11/12 — per-GPU VRAM in MB.  When > 0 (and gpu_count > 0) the
+    # server registers a VRAMPool segment so this node can participate in
+    # distributed LLM pipeline runs.  Defaults to 0 (no VRAM contribution).
+    vram_mb: int = 0
 
 
 @dataclass
