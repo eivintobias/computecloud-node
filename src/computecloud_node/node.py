@@ -683,7 +683,106 @@ class ComputeNode:
         for domain in KNOWN_MINING_POOL_DOMAINS:
             docker_cmd += ["--add-host", f"{domain}:127.0.0.1"]
 
-        if command:
+        # ── Phase 17b: Workbench door — workspace + SDK injection ──
+        workspace_block = session_data.get("workspace")
+        pool_env = session_data.get("pool_env")
+        ssh_public_keys = session_data.get("ssh_public_keys", [])
+
+        # Build the startup script that runs inside the container.
+        startup_parts: list[str] = []
+
+        if workspace_block or pool_env:
+            # Inject Pool SDK env vars into the container.
+            if pool_env:
+                pool_api_url = str(self._http_client.base_url).rstrip("/")
+                docker_cmd += [
+                    "-e", f"POOL_API_URL={pool_api_url}",
+                    "-e", f"POOL_TOKEN={pool_env.get('POOL_TOKEN', '')}",
+                    "-e", f"POOL_WORKSPACE_ID={pool_env.get('POOL_WORKSPACE_ID', '')}",
+                ]
+
+            # Best-effort pip install of the Pool SDK (images without
+            # Python/pip simply skip this — SSH still works).
+            startup_parts.append(
+                "pip install computecloud-sdk 2>/dev/null || true"
+            )
+
+            # Workspace file sync: download files into /workspace.
+            if workspace_block:
+                files = workspace_block.get("files", [])
+                dl_prefix = workspace_block.get("download_path_prefix", "")
+                pool_token = pool_env.get("POOL_TOKEN", "") if pool_env else ""
+                base_url = str(self._http_client.base_url).rstrip("/")
+                startup_parts.append("mkdir -p /workspace")
+                for f_info in files:
+                    rel_path = f_info.get("relative_path", "")
+                    if not rel_path:
+                        continue
+                    # Download each file via the existing workspace HTTP endpoint.
+                    url = f"{base_url}{dl_prefix}/{rel_path}"
+                    # Ensure subdirs exist inside /workspace.
+                    mkdir_cmd = (
+                        f'mkdir -p /workspace/$(dirname "{rel_path}")'
+                    )
+                    curl_cmd = (
+                        f'curl -sf -H "Authorization: Bearer {pool_token}" '
+                        f'-o "/workspace/{rel_path}" "{url}" || true'
+                    )
+                    startup_parts.append(mkdir_cmd)
+                    startup_parts.append(curl_cmd)
+
+            # Install a helper script for pushing results back.
+            startup_parts.append(
+                "cat > /usr/local/bin/pool-push << 'PUSHEOF'\n"
+                "#!/bin/sh\n"
+                "# Push a file back to the workspace (Pool SDK one-liner).\n"
+                "# Usage: pool-push <local_file> [remote_path]\n"
+                "python3 -c \"\n"
+                "import sys, os\n"
+                "try:\n"
+                "    from computecloud_sdk import Pool\n"
+                "    pool = Pool(os.environ.get('POOL_API_URL',''), "
+                "os.environ.get('POOL_TOKEN',''))\n"
+                "    ws = pool.workspace(os.environ.get('POOL_WORKSPACE_ID',''))\n"
+                "    local = sys.argv[1]\n"
+                "    remote = sys.argv[2] if len(sys.argv) > 2 else "
+                "os.path.basename(local)\n"
+                "    ws.upload(local, remote)\n"
+                "    print(f'Pushed {local} -> {remote}')\n"
+                "except Exception as e:\n"
+                "    print(f'pool-push failed: {e}', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "\" \"$@\"\n"
+                "PUSHEOF\n"
+                "chmod +x /usr/local/bin/pool-push 2>/dev/null || true"
+            )
+
+        # ── SSH public-key injection (Phase 17b) ──
+        if session_type == "ssh" and ssh_public_keys:
+            # Inject public keys into authorized_keys via a startup script.
+            # The linuxserver/openssh-server image supports USER_NAME env;
+            # we append the keys to the appropriate authorized_keys file.
+            keys_str = "\n".join(ssh_public_keys)
+            # Use a heredoc to write keys safely.
+            startup_parts.append(
+                f"mkdir -p /config/.ssh && "
+                f"printf '%s\\n' '{keys_str}' >> /config/.ssh/authorized_keys && "
+                f"chmod 700 /config/.ssh && "
+                f"chmod 600 /config/.ssh/authorized_keys 2>/dev/null || true"
+            )
+
+        # ── Build the final command ──
+        # If there are startup parts, prepend them to the template command.
+        if startup_parts:
+            startup_script = " && ".join(startup_parts)
+            if command:
+                full_command = f"{startup_script} ; {command}"
+            else:
+                # No template command — run startup, then keep the container
+                # alive (the image's entrypoint handles the main process).
+                full_command = f"{startup_script} ; tail -f /dev/null"
+            docker_cmd += [docker_image, "/bin/sh", "-c", full_command]
+        elif command:
             docker_cmd += [docker_image, "/bin/sh", "-c", command]
         else:
             docker_cmd += [docker_image]

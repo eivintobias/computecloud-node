@@ -3,6 +3,22 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.0
+
+- **Workbench door support (Phase 17b)**: the node now supports
+  workspace-linked sessions — SSH/Jupyter sessions that are interactive
+  entry points into the user's workspace.  When a session has a
+  `workspace` block in the pull payload, the node:
+  - Injects `POOL_API_URL`, `POOL_TOKEN`, `POOL_WORKSPACE_ID` env vars.
+  - Best-effort `pip install computecloud-sdk` (images without Python/pip
+    skip it — SSH still works).
+  - Syncs workspace files into `/workspace` via the existing workspace
+    HTTP endpoints (NAT-proof — no new file-transfer protocol).
+  - Installs a `/usr/local/bin/pool-push` helper script for pushing
+    results back.
+  - Injects the user's SSH public keys into `authorized_keys` for
+    passwordless auth.
+
 ## What's New in v0.5.0
 
 - **Serve real LLM layer shards**: nodes can now execute **real** LLM
