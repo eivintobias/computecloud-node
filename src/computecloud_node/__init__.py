@@ -58,6 +58,34 @@ from computecloud_node.pipeline_executor import (
 from computecloud_node.pipeline_worker import PipelineShardWorker, is_shard_task
 from computecloud_node.shard_executor_adapter import ShardAwareExecutor
 
+
+def __getattr__(name: str):
+    """Lazy attribute access for the optional ``[llm]`` extra symbols.
+
+    These live in :mod:`computecloud_node.llm` (torch/safetensors/tokenizers),
+    which is **not** imported at package level so that ``import
+    computecloud_node`` keeps working without torch installed.  The symbols are
+    only materialised when a caller actually accesses them — at which point the
+    lazy imports inside ``computecloud_node.llm.*`` fire (and raise
+    ``ImportError`` if the ``[llm]`` extra is absent, never silently).
+    """
+    _LLM_EXPORTS = {
+        "LLMShardExecutor",
+        "TorchShardModule",
+        "ShardWeightsLoader",
+        "LocalWeightsSource",
+        "HFWeightsSource",
+        "LLMTokenizer",
+        "is_llm_shard_task",
+        "probe_llm_capable",
+    }
+    if name in _LLM_EXPORTS:
+        from computecloud_node import llm as _llm  # noqa: PLC0415
+
+        return getattr(_llm, name)
+    raise AttributeError(f"module 'computecloud_node' has no attribute {name!r}")
+
+
 __all__ = [
     "NodeConfig",
     "NodeCapabilities",
@@ -80,4 +108,14 @@ __all__ = [
     "is_data_shard_task",
     "DATA_SHARD_KIND",
     "DATA_MERGE_KIND",
+    # LLM shard executor -- Phase 16 (optional [llm] extra, lazy)
+    "LLMShardExecutor",
+    "TorchShardModule",
+    "ShardWeightsLoader",
+    "LocalWeightsSource",
+    "HFWeightsSource",
+    "LLMTokenizer",
+    "is_llm_shard_task",
+    "probe_llm_capable",
 ]
+

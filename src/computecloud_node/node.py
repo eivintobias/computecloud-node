@@ -181,6 +181,29 @@ class ComputeNode:
             )
             from computecloud_node.pipeline_worker import PipelineShardWorker
 
+            # Phase 16 — probe for the optional [llm] extra (torch).  When the
+            # extra is installed, construct an LLMShardExecutor and wire it into
+            # the DataShardAwareExecutor routing so this node can execute real
+            # LLM layer shards (kind == "llm_shard").  When the extra is absent,
+            # the probe returns False, no LLMShardExecutor is built, and the
+            # routing behaves exactly as before (zero behavior change).  The
+            # heavy import lives behind probe_llm_capable() so this code path is
+            # never entered without torch — the package import stays torch-free.
+            llm_executor = None
+            try:
+                from computecloud_node.llm.executor import (
+                    LLMShardExecutor,
+                    probe_llm_capable,
+                )
+            except ImportError:
+                # The llm subpackage is part of the package but its module
+                # import can only fail if the package itself is broken — keep
+                # the try/except so a partial install never crashes startup.
+                probe_llm_capable = None
+            if probe_llm_capable is not None and probe_llm_capable():
+                llm_executor = LLMShardExecutor()
+                self.config.capabilities.llm_capable = True
+
             with self._lock:
                 self._data_worker = DataShardWorker(self._http_client)
                 self._shard_worker = PipelineShardWorker(self._http_client)
@@ -188,6 +211,7 @@ class ComputeNode:
                     self._data_worker,
                     pipeline_worker=self._shard_worker,
                     fallback=self._base_executor,
+                    llm_executor=llm_executor,
                 )
 
         response = self._register()
@@ -240,6 +264,11 @@ class ComputeNode:
             # VRAMPool segment for distributed LLM pipeline participation.
             # Defaults to 0 (backward compatible with servers that ignore it).
             "vram_mb": caps.vram_mb,
+            # Phase 16 — advertise LLM capability (additive, backward
+            # compatible).  True when the [llm] extra probed successfully at
+            # startup; the server can then assign real LLM layer shards to
+            # this node.  Older servers ignore the field.
+            "llm_capable": bool(getattr(caps, "llm_capable", False)),
         }
         # If username/password are provided, include them so the server
         # can associate this node with the user's account.

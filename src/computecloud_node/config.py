@@ -29,6 +29,11 @@ class NodeCapabilities:
     # server registers a VRAMPool segment so this node can participate in
     # distributed LLM pipeline runs.  Defaults to 0 (no VRAM contribution).
     vram_mb: int = 0
+    # Phase 16 — whether this node has the optional [llm] extra installed
+    # (torch + safetensors + tokenizers) and can execute real LLM layer shards.
+    # Defaults to False; set to True when the llm extra probes successfully.
+    # Additive, backward compatible (older servers ignore the field).
+    llm_capable: bool = False
 
 
 @dataclass

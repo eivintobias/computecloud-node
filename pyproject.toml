@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "computecloud-node"
-version = "0.4.0"
+version = "0.5.0"
 description = "ComputeCloud contributor node client — share your compute with the pool"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Eivin Tobias Mogård", email = "eivin@computecloud.dev" }]
-keywords = ["distributed-compute", "marketplace", "compute-pool", "contributor"]
+keywords = ["distributed-compute", "marketplace", "compute-pool", "contributor", "llm", "inference"]
 dependencies = [
     "httpx>=0.27",
     "websockets>=12.0",
@@ -20,6 +20,16 @@ grpc = [
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "protobuf>=4.21",
+]
+# Phase 16 — install with: pip install -e ".[llm]"  (or computecloud-node[llm]).
+# Enables serving REAL LLM layer shards (Hugging Face / local safetensors):
+# the node probes for torch at startup and, when present, constructs an
+# LLMShardExecutor and wires it into the routing.  Everything on by default
+# when the extra is installed; zero behavior change when it isn't.
+llm = [
+    "torch",
+    "safetensors",
+    "tokenizers",
 ]
 
 [project.scripts]

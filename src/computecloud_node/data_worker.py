@@ -228,10 +228,13 @@ class DataShardAwareExecutor:
         data_worker: DataShardWorker,
         pipeline_worker: Any | None = None,
         fallback: Any | None = None,
+        llm_executor: Any | None = None,
     ) -> None:
         self._data_worker = data_worker
         self._pipeline_worker = pipeline_worker
         self._fallback = fallback
+        # Phase 16 — optional LLM shard executor for real torch layer shards.
+        self._llm_executor = llm_executor
 
     def execute(
         self,
@@ -242,6 +245,16 @@ class DataShardAwareExecutor:
         if is_data_shard_task(payload):
             assert payload is not None
             return self._data_worker.execute_shard(payload)
+        # Phase 16 — LLM shard tasks (real torch layer shards).
+        if isinstance(payload, dict) and payload.get("kind") == "llm_shard":
+            if self._llm_executor is not None:
+                return self._llm_executor.execute(
+                    task_id=task_id, job_id=job_id, payload=payload
+                )
+            raise ValueError(
+                f"DataShardAwareExecutor: LLM shard task {task_id} received "
+                f"but no LLM executor was configured"
+            )
         # Legacy pipeline shard tasks.
         if isinstance(payload, dict) and payload.get("kind") == "pipeline_shard":
             if self._pipeline_worker is not None:

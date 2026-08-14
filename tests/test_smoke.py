@@ -94,6 +94,15 @@ class TestPackageImports:
             "is_data_shard_task",
             "DATA_SHARD_KIND",
             "DATA_MERGE_KIND",
+            # Phase 16 — LLM shard executor exports (lazy [llm] extra).
+            "LLMShardExecutor",
+            "TorchShardModule",
+            "ShardWeightsLoader",
+            "LocalWeightsSource",
+            "HFWeightsSource",
+            "LLMTokenizer",
+            "is_llm_shard_task",
+            "probe_llm_capable",
         }
         actual = set(computecloud_node.__all__)
         assert expected <= actual, f"Missing exports: {expected - actual}"

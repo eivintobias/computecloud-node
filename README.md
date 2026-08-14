@@ -3,6 +3,67 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.5.0
+
+- **Serve real LLM layer shards**: nodes can now execute **real** LLM
+  transformer layer shards (download only your layer range's weights from
+  Hugging Face, or read local `.safetensors` files), run a forward pass over
+  those layers, and exchange activations via the stdlib-only
+  `TensorPayload` wire format.  This is the Phase 16 sync of the in-repo Phase
+  15b/15c LLM capability into the standalone package.
+- **Install the optional `[llm]` extra** to enable it::
+
+      pip install -e ".[llm]"        # from a local clone
+      # or, for end users:
+      pip install --upgrade "computecloud-node[llm]"
+
+  This pulls in `torch`, `safetensors`, and `tokenizers` (the heavy ML deps).
+  Without the extra, the node behaves **exactly as v0.4.0** — `import
+  computecloud_node` works without torch, and the routing never touches the LLM
+  path.  The extra is **lazily** imported: no heavy module is loaded at package
+  import time, only inside the shard executor's methods.
+- **GPU auto-detected, fp16 on GPU**: the shard executor picks `fp16` when a
+  CUDA GPU is available and `fp32` otherwise (overridable via the module's
+  `force_dtype`).  Shard weights are loaded **partially** — only the node's
+  assigned layer range — so a 7B model split across 4 nodes each downloads
+  ~1/4 of the weights.
+- **Autoregressive generation with distributed KV cache** (Phase 15c): the
+  executor keeps a per-`(run_id, shard_index)` LRU KV cache so multi-pass
+  generation reuses keys/values across passes (only the newest token is
+  processed after the first pass).  RoPE positions are offset to the cached
+  sequence length for correctness.
+- **`llm_capable` advertised in registration**: at startup the node probes
+  `probe_llm_capable()` and, when true, constructs an `LLMShardExecutor` and
+  passes it into the `DataShardAwareExecutor` routing, and sets
+  `llm_capable=True` in the HTTP registration so the coordinator knows it can
+  hand this node real LLM shards.  Everything is **on by default when the extra
+  is installed**; **zero behavior change when it isn't**.
+- **`--vram` flag recommendation**: to participate in distributed LLM
+  inference, advertise your GPU's VRAM with `--vram <MB>` (e.g.
+  `--vram 24000` for a 24 GB GPU) alongside `--gpu 1`.  The coordinator uses
+  VRAM to plan layer-shard assignments across nodes.
+
+### Serving LLM shards
+
+```bash
+# 1. Install with the [llm] extra
+pip install -e ".[llm]"
+
+# 2. Start the node — it auto-probes torch and advertises llm_capable
+python -m computecloud_node --http \
+  --api-url https://api.computepool.cloud \
+  --executor local \
+  --cpu 4 --ram 16 --gpu 1 --vram 24000 --disk 100 \
+  --gpu-model "RTX 4090" \
+  --username admin --password YOUR_PASSWORD
+```
+
+The coordinator can now assign `kind == "llm_shard"` tasks (with
+`weights_uri = hf://org/model@revision` or `file:///path/to/weights`).  The
+node's `DataShardAwareExecutor` routes them to the `LLMShardExecutor`, which
+downloads the layer range, runs the forward pass, and returns a
+`TensorPayload` of hidden states (or `{token, token_id}` for the last shard).
+
 ## What's New in v0.4.0
 
 - **Universal data-fabric shard participation**: nodes now automatically
