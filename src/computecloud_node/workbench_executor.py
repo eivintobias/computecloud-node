@@ -190,6 +190,18 @@ class DockerWorkbenchExecutor:
             ]
 
         startup_parts = self._build_startup_parts(session_data)
+        if startup_parts and not command:
+            # Phase 18d: command="" means "use the image's own entrypoint"
+            # (e.g. s6 /init on linuxserver images, which starts sshd).
+            # Wrapping startup parts in /bin/sh -c would REPLACE that
+            # entrypoint (container idles on `tail -f /dev/null`, no service
+            # ever starts).  Resolve the image's real entrypoint and exec it
+            # after the startup script instead.
+            entrypoint = self._image_entrypoint(docker_image)
+            if entrypoint:
+                import shlex as _shlex
+
+                command = "exec " + _shlex.join(entrypoint)
         docker_cmd += self._build_final_command(
             docker_image, command, startup_parts,
         )
@@ -345,6 +357,32 @@ class DockerWorkbenchExecutor:
                 " 2>/dev/null || true"
             )
         return parts
+
+    @staticmethod
+    def _image_entrypoint(image: str) -> list[str]:
+        """Resolve an image's configured ENTRYPOINT+CMD via ``docker image
+        inspect`` (the image is always local — it was just pulled/run).
+
+        Returns [] on any failure; callers fall back to the previous
+        behavior (``tail -f /dev/null`` idle) which the 18c self-heal ladder
+        will catch and report.
+        """
+        try:
+            result = subprocess.run(
+                [_find_docker(), "image", "inspect", "--format",
+                 "{{json .Config}}", image],
+                capture_output=True, text=True, timeout=30.0,
+            )
+            if result.returncode != 0:
+                return []
+            import json as _json
+
+            cfg = _json.loads(result.stdout)
+            ep = cfg.get("Entrypoint") or []
+            cmd = cfg.get("Cmd") or []
+            return [str(x) for x in (*ep, *cmd)]
+        except Exception:
+            return []
 
     @staticmethod
     def _build_final_command(

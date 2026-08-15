@@ -311,3 +311,77 @@ class TestSelfHealLadder:
         assert "did not start" in report[2]
         assert "sshd: boom" in report[2]
 
+
+class TestEntrypointWrapping:
+    """Phase 18d — startup scripts must not replace the image's entrypoint.
+
+    Regression: an SSH workbench with injected keys used to idle on
+    ``tail -f /dev/null`` — the image's /init (sshd) never ran.
+    """
+
+    def _payload(self, keys: list[str]) -> dict:
+        return {
+            "session_id": "sess-entrypoint",
+            "session_type": "ssh",
+            "docker_image": "linuxserver/openssh-server:latest",
+            "command": "",
+            "container_port": 2222,
+            "ssh_public_keys": keys,
+        }
+
+    def test_ssh_with_keys_execs_image_entrypoint(self):
+        ex = DockerWorkbenchExecutor()
+        with (
+            mock.patch.object(
+                DockerWorkbenchExecutor, "_image_entrypoint", return_value=["/init"]
+            ),
+            mock.patch.object(
+                DockerWorkbenchExecutor, "_run_docker", return_value="cid123"
+            ) as mock_run,
+            mock.patch(
+                "computecloud_node.workbench_executor._wait_for_port",
+                return_value=True,
+            ),
+        ):
+            handle = ex.start_session(self._payload(["ssh-ed25519 AAAA test"]))
+        assert handle.container_id == "cid123"
+        docker_cmd = mock_run.call_args[0][0]
+        script = docker_cmd[docker_cmd.index("-c") + 1]
+        assert "authorized_keys" in script
+        assert "exec /init" in script
+        assert "tail -f /dev/null" not in script
+
+    def test_ssh_without_keys_keeps_bare_image(self):
+        ex = DockerWorkbenchExecutor()
+        with (
+            mock.patch.object(
+                DockerWorkbenchExecutor, "_run_docker", return_value="cid123"
+            ) as mock_run,
+            mock.patch(
+                "computecloud_node.workbench_executor._wait_for_port",
+                return_value=True,
+            ),
+        ):
+            ex.start_session(self._payload([]))
+        docker_cmd = mock_run.call_args[0][0]
+        assert docker_cmd[-1] == "linuxserver/openssh-server:latest"
+        assert "-c" not in docker_cmd
+
+    def test_image_entrypoint_parses_config(self):
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(
+                returncode=0,
+                stdout='{"Entrypoint": ["/init"], "Cmd": ["run"]}\n',
+            )
+            assert DockerWorkbenchExecutor._image_entrypoint("img") == ["/init", "run"]
+
+    def test_image_entrypoint_failure_returns_empty(self):
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=1, stdout="", stderr="x")
+            assert DockerWorkbenchExecutor._image_entrypoint("img") == []
+
+

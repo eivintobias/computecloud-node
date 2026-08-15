@@ -3,6 +3,16 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.5
+
+- **Fix: SSH workbenches with injected SSH keys never started sshd (Phase
+  18d)**.  When a session carried `ssh_public_keys`, the key-injection startup
+  script *replaced* the image's own entrypoint with `tail -f /dev/null` — the
+  container stayed "running" but nothing ever listened.  The node now resolves
+  the image's real ENTRYPOINT via `docker image inspect` and execs it after
+  the startup script (`exec /init` on linuxserver images), so s6 + sshd start
+  normally.  Workbenches without keys were unaffected.
+
 ## What's New in v0.6.4
 
 - **Session self-healing + diagnostics (Phase 18c)**: before reporting a
