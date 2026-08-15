@@ -652,6 +652,14 @@ class ComputeNode:
             self._report_session_terminated(session_id, "failed", str(exc))
             return
 
+        # Phase 18c: deep-verify the service before reporting ready — a bare
+        # TCP port-open is not enough (Docker's port proxy accepts before the
+        # in-container service serves).  Self-heal ladder inside.
+        if getattr(handle, "executor_type", "") == "docker":
+            handle = self._verify_and_heal_session(executor, payload, handle)
+            if handle is None:
+                return
+
         host_port = handle.host_port
         self._active_sessions[session_id] = handle
 
@@ -758,6 +766,83 @@ class ComputeNode:
         self._report_session_terminated(session_id, "completed", "Terminated by renter")
         self._active_sessions.pop(session_id, None)
 
+
+    def _verify_and_heal_session(self, executor, payload: dict, handle):
+        """Phase 18c: deep-verify the session's service before reporting ready.
+
+        Ladder: probe (x3, covers slow service boot) -> restart container ->
+        re-pull image and retry -> give up and report the failure WITH the
+        container log tail (visible in the dashboard — no physical access to
+        the contributor machine needed).
+
+        Returns the (possibly restarted) SessionHandle, or None after the
+        failure has been reported.
+        """
+        import time as _time
+
+        from computecloud_node.workbench_executor import probe_session_service
+
+        session_id = payload["session_id"]
+        stype = payload.get("session_type", "")
+
+        for attempt in range(3):
+            problem = probe_session_service(handle.host_port, stype)
+            if problem is None:
+                return handle
+            logger.warning(
+                "Session %s service probe failed (%s) — retry %d/3",
+                session_id[:8], problem, attempt + 1,
+            )
+            _time.sleep(5.0)
+
+        # Step 2: restart the container once.
+        logger.warning("Session %s: service not answering — restarting container", session_id[:8])
+        try:
+            executor.stop_session(handle)
+            handle = executor.start_session(payload)
+        except Exception as exc:
+            self._report_session_terminated(
+                session_id, "failed", f"container restart failed: {exc}"
+            )
+            return None
+        if probe_session_service(handle.host_port, stype) is None:
+            logger.info("Session %s healthy after container restart", session_id[:8])
+            return handle
+
+        # Step 3: re-pull the image (stale/corrupt local cache), retry once.
+        if hasattr(executor, "repull_image"):
+            logger.warning("Session %s: still dead — re-pulling image", session_id[:8])
+            try:
+                executor.stop_session(handle)
+                executor.repull_image(payload)
+                handle = executor.start_session(payload)
+            except Exception as exc:
+                self._report_session_terminated(
+                    session_id, "failed", f"image re-pull/restart failed: {exc}"
+                )
+                return None
+            if probe_session_service(handle.host_port, stype) is None:
+                logger.info("Session %s healthy after image re-pull", session_id[:8])
+                return handle
+
+        # Step 4: give up — report WITH the container log tail.
+        logs = ""
+        if hasattr(executor, "container_logs"):
+            try:
+                logs = executor.container_logs(handle, tail=40)
+            except Exception:
+                pass
+        try:
+            executor.stop_session(handle)
+        except Exception:
+            pass
+        self._report_session_terminated(
+            session_id,
+            "failed",
+            "Session service did not start (self-heal exhausted). "
+            + (f"Container log tail: {logs}" if logs else "No container logs available."),
+        )
+        return None
 
     def _run_tunnel(self, session_id: str, host_port: int, tunnel_token: str = "") -> None:
         """Run a WebSocket reverse-tunnel to the server (NAT-proof).

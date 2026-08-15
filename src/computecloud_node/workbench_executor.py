@@ -63,6 +63,34 @@ def _wait_for_port(host_port: int, timeout: float = 180.0) -> bool:
     return False
 
 
+def probe_session_service(
+    host_port: int, session_type: str, timeout: float = 10.0
+) -> str | None:
+    """Deep-check that the session's service actually speaks on the port.
+
+    A bare TCP connect is NOT enough: Docker's port proxy accepts connections
+    before the in-container service is serving, so a broken container would
+    otherwise become a "ready but silent" session.  For SSH the sshd banner
+    (``SSH-...``) must arrive within *timeout*; other types only need the
+    connect (HTTP services vary too much to probe generically).
+
+    Returns ``None`` when healthy, else a short problem description.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", host_port), timeout=timeout) as s:
+            if session_type != "ssh":
+                return None
+            s.settimeout(timeout)
+            banner = s.recv(64)
+            if banner.startswith(b"SSH-"):
+                return None
+            if not banner:
+                return "connection closed without banner"
+            return f"unexpected banner: {banner[:32]!r}"
+    except OSError as exc:
+        return f"connect/read failed: {exc}"
+
+
 def _find_docker() -> str:
     if sys.platform != "win32":
         return "docker"
@@ -191,6 +219,28 @@ class DockerWorkbenchExecutor:
                     and result.stdout.strip() == "true")
         except Exception:
             return False
+
+    def repull_image(self, session_data: dict[str, Any]) -> None:
+        """``docker pull`` the session's image (fixes stale/corrupt caches)."""
+        image = session_data["docker_image"]
+        logger.info("Re-pulling image %s for session self-heal", image)
+        subprocess.run(
+            [_find_docker(), "pull", image],
+            capture_output=True, text=True, timeout=600.0,
+        )
+
+    def container_logs(self, handle: SessionHandle, tail: int = 40) -> str:
+        """Return the last *tail* lines of the container's logs ('' on failure)."""
+        if not handle.container_id:
+            return ""
+        try:
+            result = subprocess.run(
+                [_find_docker(), "logs", "--tail", str(tail), handle.container_id],
+                capture_output=True, text=True, timeout=15.0,
+            )
+            return (result.stdout + result.stderr).strip()[-2000:]
+        except Exception:
+            return ""
 
     @staticmethod
     def _ssh_security_args() -> list[str]:

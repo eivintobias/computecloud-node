@@ -3,6 +3,18 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.4
+
+- **Session self-healing + diagnostics (Phase 18c)**: before reporting a
+  workbench "ready", the node now *deep-verifies* the service (for SSH: the
+  `SSH-...` banner must actually arrive — a bare TCP accept from Docker's
+  port proxy is no longer enough).  If the probe fails, the node walks an
+  automatic ladder: retry (slow service boot) → restart the container →
+  `docker pull` the image and retry (fixes stale/corrupt caches) → give up
+  and report the failure **with the container log tail attached**, visible in
+  the session's dashboard message.  "Ready but silent" sessions should no
+  longer be possible.
+
 ## What's New in v0.6.3
 
 - **Docker Desktop auto-start**: when the node launches with `--executor docker`

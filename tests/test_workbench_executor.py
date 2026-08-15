@@ -16,6 +16,7 @@ from computecloud_node.workbench_executor import (
     SessionHandle,
     WorkbenchExecutor,
     create_workbench_executor,
+    probe_session_service,
 )
 
 
@@ -158,3 +159,155 @@ class TestNodeConfigField:
         from computecloud_node.config import NodeConfig
 
         assert NodeConfig().workbench_executor == "auto"
+
+
+class _BannerServer:
+    """Configurable TCP server: sends a banner, or accepts-then-closes."""
+
+    def __init__(self, banner: bytes | None = b"SSH-2.0-OpenSSH_9.6\r\n") -> None:
+        import socket
+        import threading
+
+        self._banner = banner
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(5)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            if self._banner is not None:
+                try:
+                    conn.sendall(self._banner)
+                except OSError:
+                    pass
+            conn.close()
+
+
+class TestProbeSessionService:
+    """Phase 18c — deep service probe used by the self-heal ladder."""
+
+    def test_ssh_banner_ok(self):
+        srv = _BannerServer()
+        assert probe_session_service(srv.port, "ssh", timeout=3.0) is None
+
+    def test_ssh_banner_wrong(self):
+        srv = _BannerServer(banner=b"HTTP/1.1 400\r\n")
+        problem = probe_session_service(srv.port, "ssh", timeout=3.0)
+        assert problem is not None and "unexpected banner" in problem
+
+    def test_ssh_no_banner(self):
+        srv = _BannerServer(banner=None)
+        problem = probe_session_service(srv.port, "ssh", timeout=1.0)
+        assert problem is not None
+
+    def test_closed_port(self):
+        import socket as _socket
+
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        assert probe_session_service(port, "ssh", timeout=1.0) is not None
+
+    def test_non_ssh_needs_only_connect(self):
+        srv = _BannerServer(banner=None)
+        assert probe_session_service(srv.port, "jupyter", timeout=2.0) is None
+
+
+class TestDockerDiagnostics:
+    """Phase 18c — repull_image / container_logs on DockerWorkbenchExecutor."""
+
+    def test_repull_image_pulls(self):
+        ex = DockerWorkbenchExecutor()
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0)
+            ex.repull_image({"docker_image": "linuxserver/openssh-server:latest"})
+        cmd = mock_run.call_args[0][0]
+        assert "pull" in cmd and "linuxserver/openssh-server:latest" in cmd
+
+    def test_container_logs_tail(self):
+        ex = DockerWorkbenchExecutor()
+        h = SessionHandle(host_port=1, auth_token="t", container_id="abc123")
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(
+                returncode=0, stdout="log-line\n", stderr=""
+            )
+            logs = ex.container_logs(h, tail=10)
+        assert "log-line" in logs
+
+    def test_container_logs_no_container(self):
+        ex = DockerWorkbenchExecutor()
+        h = SessionHandle(host_port=1, auth_token="t")
+        assert ex.container_logs(h) == ""
+
+
+class TestSelfHealLadder:
+    """Phase 18c — ComputeNode._verify_and_heal_session."""
+
+    def _node(self):
+        from computecloud_node.node import ComputeNode
+
+        node = ComputeNode.__new__(ComputeNode)
+        node._report_session_terminated = mock.MagicMock()
+        return node
+
+    def _payload(self) -> dict:
+        return {
+            "session_id": "sess-1234-5678",
+            "session_type": "ssh",
+            "docker_image": "linuxserver/openssh-server:latest",
+        }
+
+    def test_healthy_first_probe(self):
+        node = self._node()
+        handle = SessionHandle(
+            host_port=1, auth_token="t", container_id="c1", executor_type="docker"
+        )
+        executor = mock.MagicMock()
+        with mock.patch(
+            "computecloud_node.workbench_executor.probe_session_service",
+            return_value=None,
+        ):
+            assert node._verify_and_heal_session(executor, self._payload(), handle) is handle
+        executor.stop_session.assert_not_called()
+        node._report_session_terminated.assert_not_called()
+
+    def test_exhausted_reports_failure_with_logs(self):
+        node = self._node()
+        h1 = SessionHandle(
+            host_port=1, auth_token="t", container_id="c1", executor_type="docker"
+        )
+        h2 = SessionHandle(
+            host_port=2, auth_token="t", container_id="c2", executor_type="docker"
+        )
+        h3 = SessionHandle(
+            host_port=3, auth_token="t", container_id="c3", executor_type="docker"
+        )
+        executor = mock.MagicMock()
+        executor.start_session.side_effect = [h2, h3]
+        executor.container_logs.return_value = "sshd: boom"
+        with (
+            mock.patch(
+                "computecloud_node.workbench_executor.probe_session_service",
+                return_value="dead",
+            ),
+            mock.patch("time.sleep"),
+        ):
+            result = node._verify_and_heal_session(executor, self._payload(), h1)
+        assert result is None
+        executor.repull_image.assert_called_once()
+        report = node._report_session_terminated.call_args[0]
+        assert report[1] == "failed"
+        assert "did not start" in report[2]
+        assert "sshd: boom" in report[2]
+
