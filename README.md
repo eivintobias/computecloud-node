@@ -3,6 +3,21 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.3
+
+- **Docker Desktop auto-start**: when the node launches with `--executor docker`
+  or `--executor auto` and the Docker daemon is not responding, the client now
+  tries to launch Docker Desktop (Windows/macOS) and waits up to 2 minutes for
+  the engine to come up before giving up.  This fixes workbench failures (e.g.
+  SSH doors) on nodes where Docker Desktop was installed but not running.
+  Disable with `--no-docker-autostart` (or `COMPUTECLOUD_DOCKER_AUTOSTART=0`).
+  On Linux the daemon is a system service — start it with
+  `sudo systemctl start docker` instead.
+- **Tunnel authentication (Phase 18a)**: the node now presents the per-session
+  tunnel token (from the session/pull payload) when opening the reverse
+  tunnel WebSocket, so only the assigned node can pipe a session's traffic.
+  Older servers ignore it — fully backward compatible.
+
 ## What's New in v0.6.2
 
 - **Notebook door support (Phase 17c)**: the node now drops a starter
@@ -79,7 +94,7 @@ pip install -e ".[llm]"
 # 2. Start the node — it auto-probes torch and advertises llm_capable
 python -m computecloud_node --http \
   --api-url https://api.computepool.cloud \
-  --executor local \
+  --executor auto \
   --cpu 4 --ram 16 --gpu 1 --vram 24000 --disk 100 \
   --gpu-model "RTX 4090" \
   --username admin --password YOUR_PASSWORD
@@ -133,7 +148,7 @@ pip install -e .
 # 2. Join the pool — share your compute and earn credits
 python -m computecloud_node --http \
   --api-url https://api.computepool.cloud \
-  --executor local \
+  --executor auto \
   --cpu 4 --ram 16 --gpu 0 --disk 100 \
   --username admin --password YOUR_PASSWORD
 ```
@@ -149,7 +164,7 @@ If you have a GPU and want to participate in distributed LLM pipeline runs:
 ```bash
 python -m computecloud_node --http \
   --api-url https://api.computepool.cloud \
-  --executor local \
+  --executor auto \
   --cpu 4 --ram 16 --gpu 1 --vram 24000 --disk 100 \
   --gpu-model "RTX 4090" \
   --username admin --password YOUR_PASSWORD
@@ -162,7 +177,7 @@ model-shard tasks to your node for distributed inference.
 
 - **Python 3.10+**
 - **httpx** (installed automatically by `pip install`)
-- **Docker** (optional — only needed for template/instance jobs with `--executor docker` or `--executor auto`)
+- **Docker** (optional — needed for template/instance jobs and SSH workbenches with `--executor docker` or `--executor auto`). The daemon must be **running**; v0.6.3+ tries to auto-start Docker Desktop at launch (disable with `--no-docker-autostart`)
 
 ## Options
 
@@ -185,6 +200,7 @@ python -m computecloud_node --help
 | `--password` | `""` | Your website password |
 | `--max-tasks` | `4` | Max concurrent tasks |
 | `--tags` | `[]` | Tags (e.g. `gpu spot`) |
+| `--no-docker-autostart` | off | Don't auto-start Docker Desktop when the daemon is down |
 
 ## How It Works
 

@@ -25,14 +25,18 @@ failure (use LocalProcessExecutor for plain shell tasks instead).
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any
 
 from computecloud_node.executor import TaskExecutor
 from computecloud_node.local_executor import CommandResult
+
+logger = logging.getLogger(__name__)
 
 
 def _find_docker() -> str:
@@ -61,6 +65,54 @@ def _find_docker() -> str:
         if c and os.path.isfile(c):
             return c
     return "docker"
+
+
+def _find_docker_desktop_app() -> str | None:
+    """Resolve the Docker Desktop application executable (Windows only)."""
+    if sys.platform != "win32":
+        return None
+    candidates = [
+        os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Programs", "DockerDesktop", "Docker Desktop.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles", ""),
+            "Docker", "Docker", "Docker Desktop.exe",
+        ),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def _launch_docker_desktop() -> bool:
+    """Best-effort launch of Docker Desktop.  True = a launch was attempted.
+
+    Linux is intentionally excluded: the daemon is a system service there
+    (``sudo systemctl start docker``) and needs root — we just report.
+    """
+    try:
+        if sys.platform == "win32":
+            app = _find_docker_desktop_app()
+            if not app:
+                return False
+            subprocess.Popen(
+                [app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
+        if sys.platform == "darwin":
+            if not os.path.isdir("/Applications/Docker.app"):
+                return False
+            subprocess.Popen(
+                ["open", "-a", "Docker"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
+    except OSError:
+        return False
+    return False
 
 
 class DockerExecutor(TaskExecutor):
@@ -232,3 +284,33 @@ class DockerExecutor(TaskExecutor):
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+
+
+
+def ensure_docker_running(
+    timeout_seconds: float = 120.0,
+    poll_interval_seconds: float = 2.0,
+) -> bool:
+    """Ensure the Docker daemon is up, starting Docker Desktop if needed.
+
+    1. Daemon already responding → ``True`` immediately.
+    2. Otherwise try to launch Docker Desktop (Windows/macOS) and poll
+       ``docker info`` until the daemon answers or *timeout_seconds* elapses
+       (cold starts commonly take 30–60s).
+    3. Returns ``False`` when there is nothing to launch (Linux, or Docker
+       not installed) or the daemon never came up.
+    """
+    if DockerExecutor.is_docker_available():
+        return True
+    logger.info("Docker daemon not responding — attempting to start Docker Desktop")
+    if not _launch_docker_desktop():
+        logger.info("No Docker Desktop app to launch (not installed or unsupported OS)")
+        return False
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if DockerExecutor.is_docker_available():
+            logger.info("Docker daemon is up")
+            return True
+        time.sleep(poll_interval_seconds)
+    logger.warning("Timed out waiting for the Docker daemon (%.0fs)", timeout_seconds)
+    return DockerExecutor.is_docker_available()

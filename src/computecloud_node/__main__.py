@@ -11,6 +11,8 @@ Configuration is via environment variables:
     COMPUTECLOUD_API_KEY        Optional API key
     COMPUTECLOUD_MAX_TASKS      Max concurrent tasks   (default: 4)
     COMPUTECLOUD_EXECUTOR       Executor entry point  (default: echo)
+    COMPUTECLOUD_DOCKER_AUTOSTART  Auto-start Docker Desktop when the daemon
+                                is down (default: 1; set 0/false/no to disable)
 
 The default ``echo`` executor returns the task payload back as the result
 — useful for smoke-testing pool connectivity without writing custom logic.
@@ -112,6 +114,33 @@ def _resolve_executor(name: str):
     mod = sys.modules[module_path]
     cls = getattr(mod, attr)
     return cls()
+
+
+def _maybe_autostart_docker(executor_name: str, enabled: bool) -> None:
+    """Start Docker Desktop when the executor can use it and it is down.
+
+    Only runs for the ``docker``/``auto`` executors.  Workbench sessions
+    probe Docker per-session and benefit from the daemon already being up.
+    Never raises.
+    """
+    if not enabled or executor_name not in ("docker", "auto"):
+        return
+    from computecloud_node.docker_executor import (
+        DockerExecutor,
+        ensure_docker_running,
+    )
+
+    if DockerExecutor.is_docker_available():
+        return
+    print("Docker daemon not responding -- starting Docker Desktop (can take ~1 min)...")
+    if ensure_docker_running(timeout_seconds=120.0):
+        print("Docker daemon is up -- template jobs + Docker workbenches enabled")
+    else:
+        print(
+            "Docker still unavailable -- template jobs + Docker workbenches "
+            "will fail; plain shell jobs OK"
+        )
+        print("  (install/start Docker Desktop; use --no-docker-autostart to skip this)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -236,6 +265,16 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Tags to advertise to the pool (e.g. gpu spot)",
     )
+    parser.add_argument(
+        "--no-docker-autostart",
+        action="store_true",
+        default=os.environ.get("COMPUTECLOUD_DOCKER_AUTOSTART", "1").lower()
+        in ("0", "false", "no"),
+        help=(
+            "Do not auto-start Docker Desktop when the daemon is down "
+            "(default: auto-start is attempted for docker/auto executors)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Resolve aliases: --cpu overrides --cpu-cores, --ram overrides --memory-mb
@@ -267,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         password=args.password,
     )
 
+    _maybe_autostart_docker(args.executor, enabled=not args.no_docker_autostart)
     executor = _resolve_executor(args.executor)
     node = ComputeNode(config, executor=executor)
 

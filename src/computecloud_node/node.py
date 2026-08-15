@@ -678,7 +678,7 @@ class ComputeNode:
         # Start the WebSocket reverse-tunnel (NAT-proof relay).
         tunnel_thread = threading.Thread(
             target=self._run_tunnel,
-            args=(session_id, host_port),
+            args=(session_id, host_port, session_data.get("tunnel_token", "")),
             daemon=True,
             name=f"tunnel-{session_id[:8]}",
         )
@@ -759,7 +759,7 @@ class ComputeNode:
         self._active_sessions.pop(session_id, None)
 
 
-    def _run_tunnel(self, session_id: str, host_port: int) -> None:
+    def _run_tunnel(self, session_id: str, host_port: int, tunnel_token: str = "") -> None:
         """Run a WebSocket reverse-tunnel to the server (NAT-proof).
 
         The node opens a persistent WebSocket to the server at
@@ -780,6 +780,9 @@ class ComputeNode:
 
         tunnel_path = f"/api/v1/node/{self.config.node_id}/tunnel/{session_id}"
         ws_full_url = ws_url + tunnel_path
+        # Phase 18a: present the per-session tunnel token (hijack protection).
+        if tunnel_token:
+            ws_full_url += f"?token={tunnel_token}"
 
         async def _tunnel_async():
             import websockets
@@ -830,12 +833,32 @@ class ComputeNode:
                                 while True:
                                     data = await reader.read(4096)
                                     if not data:
+                                        logger.info(
+                                            "Container connection closed for session %s"
+                                            " (service may still be starting)",
+                                            session_id[:8],
+                                        )
                                         break
                                     await ws.send(data)
                             except Exception:
                                 pass
 
-                        await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+                        # Phase 18b: FIRST_COMPLETED — if the container
+                        # connection EOFs while no renter data flows, gather()
+                        # would hang forever on the other pump and the tunnel
+                        # would never reconnect (half-dead tunnel, silent
+                        # relay).  Ending either pump exits the context, and
+                        # the outer loop reconnects with a fresh container
+                        # connection (fresh service banner for the next renter).
+                        tasks = [
+                            asyncio.ensure_future(ws_to_tcp()),
+                            asyncio.ensure_future(tcp_to_ws()),
+                        ]
+                        _, pending = await asyncio.wait(
+                            tasks, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for t in pending:
+                            t.cancel()
 
                 except Exception as exc:
                     if not self._stop_event.is_set():
