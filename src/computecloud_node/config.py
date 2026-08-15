@@ -87,6 +87,9 @@ class NodeConfig:
     username: str = ""
     password: str = ""
 
+    # Phase 17d: workbench executor mode (auto / docker / native).
+    workbench_executor: str = "auto"
+
     def __post_init__(self) -> None:
         if self.node_id is None:
             hostname = socket.gethostname()

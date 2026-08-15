@@ -617,236 +617,43 @@ class ComputeNode:
         thread.start()
 
     def _run_session_container(self, session_data: dict) -> None:
-        """Start a Docker container for a session and keep it alive."""
-        import secrets as _secrets
-        import socket as _socket
-        import subprocess
+        """Start a workbench session via the pluggable WorkbenchExecutor.
+
+        Phase 17d: the Docker-specific launch logic now lives in a pluggable
+        executor (DockerWorkbenchExecutor / NativeWorkbenchExecutor).  The
+        relay/tunnel wiring below is executor-agnostic — it only needs the
+        host port from the SessionHandle.
+        """
         import time as _time
 
         session_id = session_data["session_id"]
-        docker_image = session_data["docker_image"]
-        command = session_data["command"]
-        container_port = session_data["container_port"]
-        auth_token = _secrets.token_urlsafe(12)
 
-        with _socket.socket() as s:
-            s.bind(("0.0.0.0", 0))
-            host_port = s.getsockname()[1]
-
-        docker_cmd = [
-            self._find_docker(), "run", "-d", "-p", f"{host_port}:{container_port}",
-            # ── Resource limits (Tier 2) ──
-            "--memory", f"{int(session_data.get('memory_mb', 4096))}m",
-            "--cpus", str(session_data.get("cpu_cores", 2.0)),
-            # ── Security hardening (Tier 1) ──
-            "--pids-limit", "512",                    # prevent fork bombs
-            "--ulimit", "nofile=4096:8192",           # file descriptor limit
-            "--tmpfs", "/tmp:rw,size=256m",          # writable /tmp
-        ]
-
-        # ── Session-type-aware security ──
-        # SSH sessions need capabilities for sshd to switch users and
-        # create pseudo-terminals.  The linuxserver/openssh-server image
-        # uses s6-overlay as PID 1 which also needs certain capabilities.
-        # Jupyter and other sessions get the full hardening (cap-drop ALL).
-        session_type = session_data.get("session_type", "")
-        if session_type == "ssh":
-            docker_cmd += [
-                # SSH needs SETUID/SETGID for user switching, SYS_CHROOT for
-                # sshd's chroot, DAC_OVERRIDE for password files.
-                "--cap-drop", "ALL",
-                "--cap-add", "SETUID",
-                "--cap-add", "SETGID",
-                "--cap-add", "SYS_CHROOT",
-                "--cap-add", "DAC_OVERRIDE",
-                "--cap-add", "CHOWN",
-                "--cap-add", "FOWNER",
-                "--cap-add", "KILL",
-                "--cap-add", "NET_BIND_SERVICE",
-                # linuxserver/openssh-server env vars:
-                "-e", "PASSWORD_ACCESS=TRUE",
-                "-e", "USER_PASSWORD=poolpass",
-                "-e", "USER_NAME=root",
-                "-e", "PUID=0",
-                "-e", "PGID=0",
-            ]
-            # no-new-privileges is NOT added for SSH sessions (sshd needs setuid).
-        else:
-            docker_cmd += [
-                "--security-opt", "no-new-privileges",
-                "--cap-drop", "ALL",
-            ]
-
-        # ── Network egress filtering (Tier 3) ──
-        # Block known mining pool domains by redirecting them to 127.0.0.1.
-        from computecloud_node.security_monitor import KNOWN_MINING_POOL_DOMAINS
-        for domain in KNOWN_MINING_POOL_DOMAINS:
-            docker_cmd += ["--add-host", f"{domain}:127.0.0.1"]
-
-        # ── Phase 17b: Workbench door — workspace + SDK injection ──
-        workspace_block = session_data.get("workspace")
-        pool_env = session_data.get("pool_env")
-        ssh_public_keys = session_data.get("ssh_public_keys", [])
-
-        # Build the startup script that runs inside the container.
-        startup_parts: list[str] = []
-
-        if workspace_block or pool_env:
-            # Inject Pool SDK env vars into the container.
-            if pool_env:
-                pool_api_url = str(self._http_client.base_url).rstrip("/")
-                docker_cmd += [
-                    "-e", f"POOL_API_URL={pool_api_url}",
-                    "-e", f"POOL_TOKEN={pool_env.get('POOL_TOKEN', '')}",
-                    "-e", f"POOL_WORKSPACE_ID={pool_env.get('POOL_WORKSPACE_ID', '')}",
-                ]
-
-            # Best-effort pip install of the Pool SDK (images without
-            # Python/pip simply skip this — SSH still works).
-            startup_parts.append(
-                "pip install computecloud-sdk 2>/dev/null || true"
-            )
-
-            # Workspace file sync: download files into /workspace.
-            if workspace_block:
-                files = workspace_block.get("files", [])
-                dl_prefix = workspace_block.get("download_path_prefix", "")
-                pool_token = pool_env.get("POOL_TOKEN", "") if pool_env else ""
-                base_url = str(self._http_client.base_url).rstrip("/")
-                startup_parts.append("mkdir -p /workspace")
-                for f_info in files:
-                    rel_path = f_info.get("relative_path", "")
-                    if not rel_path:
-                        continue
-                    # Download each file via the existing workspace HTTP endpoint.
-                    url = f"{base_url}{dl_prefix}/{rel_path}"
-                    # Ensure subdirs exist inside /workspace.
-                    mkdir_cmd = (
-                        f'mkdir -p /workspace/$(dirname "{rel_path}")'
-                    )
-                    curl_cmd = (
-                        f'curl -sf -H "Authorization: Bearer {pool_token}" '
-                        f'-o "/workspace/{rel_path}" "{url}" || true'
-                    )
-                    startup_parts.append(mkdir_cmd)
-                    startup_parts.append(curl_cmd)
-
-            # Install a helper script for pushing results back.
-            startup_parts.append(
-                "cat > /usr/local/bin/pool-push << 'PUSHEOF'\n"
-                "#!/bin/sh\n"
-                "# Push a file back to the workspace (Pool SDK one-liner).\n"
-                "# Usage: pool-push <local_file> [remote_path]\n"
-                "python3 -c \"\n"
-                "import sys, os\n"
-                "try:\n"
-                "    from computecloud_sdk import Pool\n"
-                "    pool = Pool(os.environ.get('POOL_API_URL',''), "
-                "os.environ.get('POOL_TOKEN',''))\n"
-                "    ws = pool.workspace(os.environ.get('POOL_WORKSPACE_ID',''))\n"
-                "    local = sys.argv[1]\n"
-                "    remote = sys.argv[2] if len(sys.argv) > 2 else "
-                "os.path.basename(local)\n"
-                "    ws.upload(local, remote)\n"
-                "    print(f'Pushed {local} -> {remote}')\n"
-                "except Exception as e:\n"
-                "    print(f'pool-push failed: {e}', file=sys.stderr)\n"
-                "    sys.exit(1)\n"
-                "\" \"$@\"\n"
-                "PUSHEOF\n"
-                "chmod +x /usr/local/bin/pool-push 2>/dev/null || true"
-            )
-
-            # ── Phase 17c: welcome notebook for Jupyter workbench doors ──
-            # Drop a starter notebook (welcome.ipynb) into /workspace so the
-            # user lands in a ready-to-go environment with the Pool SDK
-            # pre-authenticated.  Skip if the file already exists (preserves
-            # user customisations).  The notebook JSON is base64-encoded to
-            # survive shell quoting inside the heredoc.
-            if session_type == "jupyter" and workspace_block:
-                import base64 as _b64
-
-                from computecloud_node.notebook_bootstrap import WELCOME_NOTEBOOK_JSON
-
-                nb_b64 = _b64.b64encode(WELCOME_NOTEBOOK_JSON.encode()).decode()
-                startup_parts.append(
-                    f"test -f /workspace/welcome.ipynb || "
-                    f"(mkdir -p /workspace && "
-                    f"echo '{nb_b64}' | base64 -d > /workspace/welcome.ipynb) "
-                    f"2>/dev/null || true"
-                )
-
-        # ── SSH public-key injection (Phase 17b) ──
-        if session_type == "ssh" and ssh_public_keys:
-            # Inject public keys into authorized_keys via a startup script.
-            # The linuxserver/openssh-server image supports USER_NAME env;
-            # we append the keys to the appropriate authorized_keys file.
-            keys_str = "\n".join(ssh_public_keys)
-            # Use a heredoc to write keys safely.
-            startup_parts.append(
-                f"mkdir -p /config/.ssh && "
-                f"printf '%s\\n' '{keys_str}' >> /config/.ssh/authorized_keys && "
-                f"chmod 700 /config/.ssh && "
-                f"chmod 600 /config/.ssh/authorized_keys 2>/dev/null || true"
-            )
-
-        # ── Build the final command ──
-        # If there are startup parts, prepend them to the template command.
-        if startup_parts:
-            startup_script = " && ".join(startup_parts)
-            if command:
-                full_command = f"{startup_script} ; {command}"
-            else:
-                # No template command — run startup, then keep the container
-                # alive (the image's entrypoint handles the main process).
-                full_command = f"{startup_script} ; tail -f /dev/null"
-            docker_cmd += [docker_image, "/bin/sh", "-c", full_command]
-        elif command:
-            docker_cmd += [docker_image, "/bin/sh", "-c", command]
-        else:
-            docker_cmd += [docker_image]
+        from computecloud_node.workbench_executor import create_workbench_executor
 
         try:
-            result = subprocess.run(
-                docker_cmd, capture_output=True, text=True, timeout=120.0
+            executor = create_workbench_executor(
+                getattr(self.config, "workbench_executor", "auto"),
+                http_client=self._http_client,
             )
-            if result.returncode != 0:
-                logger.error(
-                    "docker run failed for session %s: %s",
-                    session_id[:8], result.stderr,
-                )
-                self._report_session_terminated(
-                    session_id, "failed", f"docker run failed: {result.stderr}"
-                )
-                return
-            container_id = result.stdout.strip()
-        except subprocess.TimeoutExpired:
-            self._report_session_terminated(session_id, "failed", "docker run timed out")
-            return
-        except FileNotFoundError:
-            self._report_session_terminated(session_id, "failed", "docker CLI not found")
+        except Exception as exc:
+            logger.error("Workbench executor init failed: %s", exc)
+            self._report_session_terminated(session_id, "failed", str(exc))
             return
 
-        self._active_sessions[session_id] = container_id
+        payload = dict(session_data)
+        payload.setdefault(
+            "_http_base_url", str(self._http_client.base_url).rstrip("/")
+        )
 
-        deadline = _time.monotonic() + 180.0
-        ready = False
-        while _time.monotonic() < deadline:
-            try:
-                with _socket.socket() as s:
-                    s.settimeout(1.0)
-                    s.connect(("127.0.0.1", host_port))
-                    ready = True
-                    break
-            except OSError:
-                _time.sleep(0.5)
-
-        if not ready:
-            self._stop_container(container_id)
-            self._report_session_terminated(
-                session_id, "failed", "Container port never opened"
-            )
+        try:
+            handle = executor.start_session(payload)
+        except Exception as exc:
+            logger.error("Session %s start failed: %s", session_id[:8], exc)
+            self._report_session_terminated(session_id, "failed", str(exc))
             return
+
+        host_port = handle.host_port
+        self._active_sessions[session_id] = handle
 
         try:
             resp = self._http_client.post(
@@ -854,21 +661,21 @@ class ComputeNode:
                 json={
                     "session_id": session_id,
                     "host_port": host_port,
-                    "auth_token": auth_token,
+                    "auth_token": handle.auth_token,
                 },
             )
             resp.raise_for_status()
         except Exception:
-            self._stop_container(container_id)
+            try:
+                executor.stop_session(handle)
+            except Exception:
+                pass
             self._report_session_terminated(session_id, "failed", "report ready failed")
             return
 
         logger.info("Session %s ready on port %d", session_id[:8], host_port)
 
-        # ── Start the WebSocket reverse-tunnel (NAT-proof relay) ──
-        # The node opens a persistent outbound WebSocket to the server,
-        # which passes through NAT/firewalls.  The server pipes the
-        # renter's traffic through this tunnel.
+        # Start the WebSocket reverse-tunnel (NAT-proof relay).
         tunnel_thread = threading.Thread(
             target=self._run_tunnel,
             args=(session_id, host_port),
@@ -877,14 +684,19 @@ class ComputeNode:
         )
         tunnel_thread.start()
 
-        # ── Security monitor (Tier 3) ──
-        from computecloud_node.security_monitor import SecurityMonitor
-        security_monitor = SecurityMonitor(
-            cpu_threshold_percent=95.0,
-            sustained_checks=10,
-        )
-        security_scan_interval = 60.0  # seconds
+        security_monitor = None
+        security_scan_interval = 60.0
         last_scan_time = _time.monotonic()
+        if getattr(handle, "executor_type", "") == "docker":
+            try:
+                from computecloud_node.security_monitor import SecurityMonitor
+
+                security_monitor = SecurityMonitor(
+                    cpu_threshold_percent=95.0,
+                    sustained_checks=10,
+                )
+            except Exception:
+                security_monitor = None
 
         while not self._stop_event.is_set():
             try:
@@ -900,45 +712,52 @@ class ComputeNode:
                 logger.exception("Session heartbeat failed for %s", session_id[:8])
 
             try:
-                inspect = subprocess.run(
-                    [self._find_docker(), "inspect", "-f", "{{.State.Running}}", container_id],
-                    capture_output=True, text=True, timeout=5.0,
-                )
-                if inspect.returncode != 0 or inspect.stdout.strip() != "true":
-                    self._report_session_terminated(
-                        session_id, "completed", "Container exited"
-                    )
-                    self._active_sessions.pop(session_id, None)
-                    return
+                alive = executor.is_session_alive(handle)
             except Exception:
-                pass
+                alive = False
+            if not alive:
+                self._report_session_terminated(
+                    session_id, "completed", "Session process exited"
+                )
+                self._active_sessions.pop(session_id, None)
+                return
 
-            # ── Security scan (Tier 3) ──
             now = _time.monotonic()
-            if now - last_scan_time >= security_scan_interval:
-                last_scan_time = now
-                alert = security_monitor.scan_container(container_id)
-                if alert is not None:
-                    logger.warning(
-                        "Security alert for session %s: %s — %s",
-                        session_id[:8], alert.alert_type, alert.details,
-                    )
-                    self._report_security_alert(session_id, alert)
-                    if alert.severity == "critical":
-                        self._stop_container(container_id)
-                        self._report_session_terminated(
-                            session_id, alert.alert_type, alert.details,
+            if security_monitor is not None and getattr(handle, "container_id", None):
+                if now - last_scan_time >= security_scan_interval:
+                    last_scan_time = now
+                    try:
+                        alert = security_monitor.scan_container(handle.container_id)
+                    except Exception:
+                        alert = None
+                    if alert is not None:
+                        logger.warning(
+                            "Security alert for session %s: %s — %s",
+                            session_id[:8],
+                            alert.alert_type,
+                            alert.details,
                         )
-                        self._active_sessions.pop(session_id, None)
-                        return
+                        self._report_security_alert(session_id, alert)
+                        if alert.severity == "critical":
+                            try:
+                                executor.stop_session(handle)
+                            except Exception:
+                                pass
+                            self._report_session_terminated(
+                                session_id, alert.alert_type, alert.details
+                            )
+                            self._active_sessions.pop(session_id, None)
+                            return
 
             self._stop_event.wait(10.0)
 
-        self._stop_container(container_id)
-        self._report_session_terminated(
-            session_id, "completed", "Terminated by renter"
-        )
+        try:
+            executor.stop_session(handle)
+        except Exception:
+            pass
+        self._report_session_terminated(session_id, "completed", "Terminated by renter")
         self._active_sessions.pop(session_id, None)
+
 
     def _run_tunnel(self, session_id: str, host_port: int) -> None:
         """Run a WebSocket reverse-tunnel to the server (NAT-proof).

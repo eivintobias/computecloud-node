@@ -3,7 +3,7 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
-## What's New in v0.6.1
+## What's New in v0.6.2
 
 - **Notebook door support (Phase 17c)**: the node now drops a starter
   `welcome.ipynb` into `/workspace` when a Jupyter workbench session starts.
