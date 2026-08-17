@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 
 from computecloud_node.tensor_format import TensorPayload
@@ -22,6 +21,7 @@ from computecloud_node.tensor_format import TensorPayload
 def _build_tiny_model():
     """Build a tiny randomly-initialised Llama model and save weights + config."""
     import torch  # lazy
+
     from computecloud_node.llm.model_shard import TorchShardModule
 
     config = {
@@ -56,9 +56,8 @@ def _save_to_dir(config, state_dict, tokenizer_path=None):
 
 def _pack_tensor(t):
     """Pack a torch tensor into a TensorPayload dict."""
-    import torch
-    import struct
     import base64
+    import struct
 
     t = t.detach().cpu().float().contiguous()
     shape = tuple(int(d) for d in t.shape)
@@ -88,13 +87,14 @@ def main():
     print("Phase 15b Demo — Torch Shard Executor (node_client)")
     print("=" * 60)
 
-    from computecloud_node.llm.tokenizer import build_tiny_tokenizer, LLMTokenizer
-    from computecloud_node.llm.executor import LLMShardExecutor
     import torch
+
+    from computecloud_node.llm.executor import LLMShardExecutor
+    from computecloud_node.llm.tokenizer import LLMTokenizer, build_tiny_tokenizer
 
     tok_path = os.path.join(tempfile.mkdtemp(), "tokenizer.json")
     build_tiny_tokenizer(vocab_size=32, save_path=tok_path)
-    print(f"\n1. Built tiny tokenizer (vocab=32)")
+    print("\n1. Built tiny tokenizer (vocab=32)")
 
     config, state_dict, monolithic_module = _build_tiny_model()
     print(f"2. Built tiny Llama model: {config['num_hidden_layers']} layers, "
@@ -102,7 +102,7 @@ def main():
 
     weights_dir = _save_to_dir(config, state_dict, tok_path)
     weights_uri = f"file://{weights_dir}"
-    print(f"3. Saved weights to temp dir")
+    print("3. Saved weights to temp dir")
 
     tok = LLMTokenizer(tok_path)
     prompt = "hello world"
@@ -113,12 +113,12 @@ def main():
     mono_out = monolithic_module.forward(torch.tensor(token_ids, dtype=torch.long))
     mono_logits = mono_out[0, -1, :]
     mono_token = int(mono_logits.argmax())
-    print(f"\n5. Monolithic forward pass:")
+    print("\n5. Monolithic forward pass:")
     print(f"   Logits shape: {mono_out.shape}")
     print(f"   Top-1 token: id={mono_token}, text={tok.decode(mono_token)!r}")
 
     # Sharded run (2 shards)
-    print(f"\n6. Sharded run (2 single-layer shards):")
+    print("\n6. Sharded run (2 single-layer shards):")
     executor = LLMShardExecutor()
     shard0_payload = {
         "kind": "llm_shard", "model_name": "tiny-llama",
@@ -128,7 +128,7 @@ def main():
         "tokenizer_uri": f"file://{tok_path}",
     }
     shard0_out = executor.execute("shard-0", "demo", shard0_payload)
-    print(f"   Shard 0: layers [0,1), tokenized -> hidden_states")
+    print("   Shard 0: layers [0,1), tokenized -> hidden_states")
 
     shard1_payload = {
         "kind": "llm_shard", "model_name": "tiny-llama",
@@ -138,18 +138,18 @@ def main():
         "tokenizer_uri": f"file://{tok_path}",
     }
     shard1_out = executor.execute("shard-1", "demo", shard1_payload)
-    print(f"   Shard 1: layers [1,2), hidden_states -> logits -> greedy token")
+    print("   Shard 1: layers [1,2), hidden_states -> logits -> greedy token")
     print(f"   Top-1 token: id={shard1_out['token_id']}, text={shard1_out['token']!r}")
 
     # Correctness check
     sharded_logits = _unpack_tensor(shard1_out["logits"])[0, -1, :]
     max_diff = (mono_logits - sharded_logits).abs().max().item()
-    print(f"\n7. Correctness check:")
+    print("\n7. Correctness check:")
     print(f"   Max |monolithic - sharded| = {max_diff:.2e}")
     if max_diff < 1e-5:
-        print(f"   PASS — logits match within fp32 tolerance!")
+        print("   PASS — logits match within fp32 tolerance!")
     else:
-        print(f"   FAIL — logits do not match!")
+        print("   FAIL — logits do not match!")
 
     import shutil
     shutil.rmtree(os.path.dirname(tok_path), ignore_errors=True)

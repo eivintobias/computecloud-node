@@ -25,7 +25,6 @@ class TestPackageImports:
         from computecloud_node import (
             LocalPipelineRunner,
             PipelineShardExecutor,
-            PipelineShardWorker,
             ShardAwareExecutor,
             is_shard_task,
             run_reference,
@@ -43,7 +42,6 @@ class TestPackageImports:
             DATA_MERGE_KIND,
             DATA_SHARD_KIND,
             DataShardAwareExecutor,
-            DataShardWorker,
             is_data_shard_task,
         )
 
@@ -112,13 +110,11 @@ class TestCLIParsing:
     """The CLI must parse the new --vram flag and pipeline defaults."""
 
     def test_vram_flag_parsed(self):
-        from computecloud_node.__main__ import main
 
         # main() will try to connect and run the node, so we only test
         # argument parsing by calling the parser directly. We import main
         # and patch the node creation.
         import argparse
-        import os
 
         # Reconstruct the parser logic by checking that --vram is accepted.
         # We use a subprocess-free approach: parse_args with --help-like args.

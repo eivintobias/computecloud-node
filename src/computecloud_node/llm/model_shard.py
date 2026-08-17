@@ -33,7 +33,9 @@ def _parse_config(config):
         "num_hidden_layers": int(c.get("num_hidden_layers", c.get("n_layer", 32))),
         "num_attention_heads": n_heads,
         "num_key_value_heads": int(c.get("num_key_value_heads", c.get("n_kv_heads", n_heads))),
-        "intermediate_size": int(c.get("intermediate_size", int(c.get("hidden_size", 4096) * 2.667))),
+        "intermediate_size": int(
+            c.get("intermediate_size", int(c.get("hidden_size", 4096) * 2.667))
+        ),
         "rms_norm_eps": float(c.get("rms_norm_eps", c.get("layer_norm_eps", 1e-6))),
         "rope_theta": float(c.get("rope_theta", 10000.0)),
         "max_position_embeddings": int(c.get("max_position_embeddings", 2048)),
@@ -187,7 +189,9 @@ class TorchShardModule:
     - is_last:   hidden_states -> logits
     """
 
-    def __init__(self, config, start_layer, end_layer, *, is_first=False, is_last=False, force_dtype=None):
+    def __init__(
+        self, config, start_layer, end_layer, *, is_first=False, is_last=False, force_dtype=None
+    ):
         import torch
         import torch.nn as nn
         self._cfg = _parse_config(config)

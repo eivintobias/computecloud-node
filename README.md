@@ -3,6 +3,29 @@
 This is a lightweight, standalone package for contributor nodes to join the
 ComputeCloud pool at **computepool.cloud** — without cloning the entire repo.
 
+## What's New in v0.6.7
+
+- **SSH workbench failure fixed + the self-heal ladder now always shows WHY
+  (Phase 19 side item)**.  `docker logs` was decoded with the Windows locale
+  codec (cp1252) and crashed on the linuxserver s6 banner's UTF-8
+  box-drawing characters, so the self-heal ladder reported "No container logs
+  available" even when the container was alive and logging the exact s6 error
+  that would have explained the failure.  All docker subprocess output is now
+  decoded as UTF-8, and the ladder captures the container log tail *before*
+  each restart/re-pull rung — it never reports "No container logs available"
+  when a container existed.
+
+## What's New in v0.6.6
+
+- **SSH workbenches keep their image entrypoint (Phase 18e)**: the
+  `linuxserver/openssh-server` image now boots its own s6 `/init` untouched,
+  and the startup parts (SSH key injection, workspace sync, SDK install) run
+  *after* the container is up via `docker exec` with 3 retries.  Also fixed
+  the real root cause of sshd never starting: `USER_NAME` is now `pool` (the
+  image halts init when `USER_NAME` names an existing user — `root` does), and
+  `PASSWORD_ACCESS=true` is lowercase as the image expects.  SSH credentials
+  everywhere are now `pool@` / `poolpass`.
+
 ## What's New in v0.6.5
 
 - **Fix: SSH workbenches with injected SSH keys never started sshd (Phase

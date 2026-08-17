@@ -785,6 +785,23 @@ class ComputeNode:
         session_id = payload["session_id"]
         stype = payload.get("session_type", "")
 
+        # Phase 19 side item: capture the container log tail BEFORE each
+        # rung.  The old code only read logs at the very end — after
+        # stop_session had already `docker rm`'d the evidence.  Keep the
+        # last non-empty tail so the dashboard always shows WHY.
+        last_logs = ""
+
+        def _capture_logs(h) -> None:
+            nonlocal last_logs
+            if not hasattr(executor, "container_logs"):
+                return
+            try:
+                tail = executor.container_logs(h, tail=40)
+            except Exception:
+                tail = ""
+            if tail:
+                last_logs = tail
+
         for attempt in range(3):
             problem = probe_session_service(handle.host_port, stype)
             if problem is None:
@@ -795,7 +812,8 @@ class ComputeNode:
             )
             _time.sleep(5.0)
 
-        # Step 2: restart the container once.
+        # Step 2: capture the current container's logs, then restart once.
+        _capture_logs(handle)
         logger.warning("Session %s: service not answering — restarting container", session_id[:8])
         try:
             executor.stop_session(handle)
@@ -809,7 +827,8 @@ class ComputeNode:
             logger.info("Session %s healthy after container restart", session_id[:8])
             return handle
 
-        # Step 3: re-pull the image (stale/corrupt local cache), retry once.
+        # Step 3: capture logs, then re-pull the image (stale/corrupt cache).
+        _capture_logs(handle)
         if hasattr(executor, "repull_image"):
             logger.warning("Session %s: still dead — re-pulling image", session_id[:8])
             try:
@@ -825,23 +844,18 @@ class ComputeNode:
                 logger.info("Session %s healthy after image re-pull", session_id[:8])
                 return handle
 
-        # Step 4: give up — report WITH the container log tail.
-        logs = ""
-        if hasattr(executor, "container_logs"):
-            try:
-                logs = executor.container_logs(handle, tail=40)
-            except Exception:
-                pass
+        # Step 4: give up — report WITH the last non-empty container log tail.
+        _capture_logs(handle)
         try:
             executor.stop_session(handle)
         except Exception:
             pass
-        self._report_session_terminated(
-            session_id,
-            "failed",
-            "Session service did not start (self-heal exhausted). "
-            + (f"Container log tail: {logs}" if logs else "No container logs available."),
-        )
+        message = "Session service did not start (self-heal exhausted). "
+        if last_logs:
+            message += f"Container log tail: {last_logs}"
+        else:
+            message += "Container logs were empty on every rung."
+        self._report_session_terminated(session_id, "failed", message)
         return None
 
     def _run_tunnel(self, session_id: str, host_port: int, tunnel_token: str = "") -> None:

@@ -25,8 +25,8 @@ import base64
 import struct
 from typing import Any
 
-from computecloud_node.llm.uri import is_llm_weights_uri, parse_file_uri
 from computecloud_node.hf_uri import parse_hf_uri
+from computecloud_node.llm.uri import is_llm_weights_uri, parse_file_uri
 from computecloud_node.tensor_format import TensorPayload
 
 LLM_SHARD_KIND = "llm_shard"
@@ -48,7 +48,6 @@ def is_llm_shard_task(payload: dict[str, Any] | None) -> bool:
 
 def _torch_to_tensor_payload(tensor: Any) -> dict[str, Any]:
     """Pack a torch tensor into a TensorPayload dict (float32)."""
-    import torch  # lazy
 
     t = tensor.detach().cpu().float().contiguous()
     shape = tuple(int(d) for d in t.shape)
@@ -108,7 +107,6 @@ class LLMShardExecutor:
 
     def evict_run_id(self, run_id: str) -> int:
         """Drop all KV cache entries for *run_id* (run completed/failed/stopped)."""
-        import torch  # lazy — release tensors on GPU/CPU
         with self._kv_lock:
             keys = [k for k in list(self._kv_cache) if k[0] == run_id]
             for k in keys:
@@ -165,7 +163,9 @@ class LLMShardExecutor:
         """Run the shard forward pass and return the output dict."""
         from computecloud_node.llm.model_shard import TorchShardModule
         from computecloud_node.llm.weights import (
-            HFWeightsSource, LocalWeightsSource, ShardWeightsLoader,
+            HFWeightsSource,
+            LocalWeightsSource,
+            ShardWeightsLoader,
         )
 
         weights_uri = str(payload["weights_uri"])

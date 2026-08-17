@@ -35,11 +35,14 @@ TINY_CONFIG = {
 @pytest.fixture
 def tiny_model_dir():
     """Build a tiny 2-layer model, save weights+config+tokenizer to temp dir."""
+    from safetensors.torch import save_file
+
     from computecloud_node.llm.model_shard import TorchShardModule
     from computecloud_node.llm.tokenizer import build_tiny_tokenizer
-    from safetensors.torch import save_file
     torch.manual_seed(42)
-    module = TorchShardModule(TINY_CONFIG, 0, 2, is_first=True, is_last=True, force_dtype=torch.float32)
+    module = TorchShardModule(
+        TINY_CONFIG, 0, 2, is_first=True, is_last=True, force_dtype=torch.float32
+    )
     sd = {f"model.{k}": v.contiguous().clone() for k, v in module.module.state_dict().items()}
     tmpdir = tempfile.mkdtemp(prefix="cc_node_llm_")
     save_file(sd, os.path.join(tmpdir, "model.safetensors"))
@@ -106,8 +109,9 @@ class TestHFWeightsSourceURLs:
 
     def test_shard_url(self):
         from computecloud_node.llm.weights import HFWeightsSource
-        assert HFWeightsSource("org/model", "main").shard_url("model-00001-of-00002.safetensors") == \
-            "https://huggingface.co/org/model/resolve/main/model-00001-of-00002.safetensors"
+        assert HFWeightsSource("org/model", "main").shard_url(
+            "model-00001-of-00002.safetensors"
+        ) == "https://huggingface.co/org/model/resolve/main/model-00001-of-00002.safetensors"
 
     def test_index_url(self):
         from computecloud_node.llm.weights import HFWeightsSource
@@ -204,7 +208,9 @@ class TestShardWeightsLoader:
 
     def test_absent_keys_not_loaded(self, tiny_model_dir):
         from computecloud_node.llm.weights import LocalWeightsSource, ShardWeightsLoader
-        sd = ShardWeightsLoader(LocalWeightsSource(tiny_model_dir[0])).load_shard(1, 2, is_first=False, is_last=False)
+        sd = ShardWeightsLoader(LocalWeightsSource(tiny_model_dir[0])).load_shard(
+            1, 2, is_first=False, is_last=False
+        )
         for k in sd:
             assert not k.startswith("model.layers.0."), f"layer 0 present: {k}"
             assert not k.startswith("model.embed_tokens"), f"embed present: {k}"
@@ -231,18 +237,25 @@ class TestShardedVsMonolithic:
         with torch.no_grad():
             mono_logits = module.forward(token_ids)[0, -1, :]
             mono_token = int(mono_logits.argmax().item())
+        from computecloud_node.llm.executor import (
+            _tensor_payload_to_torch,
+            _torch_to_tensor_payload,
+        )
         from computecloud_node.llm.model_shard import TorchShardModule
         from computecloud_node.llm.weights import LocalWeightsSource, ShardWeightsLoader
-        from computecloud_node.llm.executor import _torch_to_tensor_payload, _tensor_payload_to_torch
         source = LocalWeightsSource(d)
         loader = ShardWeightsLoader(source)
-        shard0 = TorchShardModule(TINY_CONFIG, 0, 1, is_first=True, is_last=False, force_dtype=torch.float32)
+        shard0 = TorchShardModule(
+            TINY_CONFIG, 0, 1, is_first=True, is_last=False, force_dtype=torch.float32
+        )
         shard0.load_state_dict(loader.load_shard(0, 1, is_first=True, is_last=False))
         with torch.no_grad():
             hidden = shard0.forward(token_ids)
         hidden_payload = _torch_to_tensor_payload(hidden)
         hidden_back = _tensor_payload_to_torch(hidden_payload)
-        shard1 = TorchShardModule(TINY_CONFIG, 1, 2, is_first=False, is_last=True, force_dtype=torch.float32)
+        shard1 = TorchShardModule(
+            TINY_CONFIG, 1, 2, is_first=False, is_last=True, force_dtype=torch.float32
+        )
         shard1.load_state_dict(loader.load_shard(1, 2, is_first=False, is_last=True))
         with torch.no_grad():
             sharded_logits = shard1.forward(hidden_back)
@@ -317,7 +330,9 @@ class TestExecutorRouting:
             def post(self, url, json=None):
                 return _MockResp(200, {"accepted": True})
 
-        data_worker = DataShardWorker(_MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
+        data_worker = DataShardWorker(
+            _MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0
+        )
         llm_ex = LLMShardExecutor()
         adapter = DataShardAwareExecutor(data_worker, llm_executor=llm_ex)
         payload = {
@@ -340,7 +355,9 @@ class TestExecutorRouting:
             def post(self, url, json=None):
                 return _MockResp(200, {"accepted": True})
 
-        data_worker = DataShardWorker(_MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
+        data_worker = DataShardWorker(
+            _MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0
+        )
         adapter = DataShardAwareExecutor(data_worker)
         with pytest.raises(ValueError, match="no LLM executor"):
             adapter.execute("t1", "j1", {"kind": "llm_shard", "weights_uri": "file:///x"})
@@ -357,7 +374,9 @@ class TestExecutorRouting:
         class _Fallback:
             def execute(self, task_id, job_id, payload):
                 return {"stdout": "ok"}
-        data_worker = DataShardWorker(_MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
+        data_worker = DataShardWorker(
+            _MockClient(), poll_interval_seconds=0.001, poll_timeout_seconds=2.0
+        )
         adapter = DataShardAwareExecutor(data_worker, fallback=_Fallback())
         result = adapter.execute("t1", "j1", {"command": "ls"})
         assert result == {"stdout": "ok"}

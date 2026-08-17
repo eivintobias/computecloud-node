@@ -250,6 +250,22 @@ class TestDockerDiagnostics:
         h = SessionHandle(host_port=1, auth_token="t")
         assert ex.container_logs(h) == ""
 
+    def test_container_logs_uses_utf8_encoding(self):
+        """docker logs emits UTF-8 (the linuxserver s6 ASCII-art banner has
+        box-drawing chars).  Decoding with the Windows locale codec (cp1252)
+        raises UnicodeDecodeError, which was swallowed and surfaced as "No
+        container logs available".  Must decode as UTF-8 with replacement."""
+        ex = DockerWorkbenchExecutor()
+        h = SessionHandle(host_port=1, auth_token="t", container_id="abc123")
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout="", stderr="")
+            ex.container_logs(h, tail=10)
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+
 
 class TestSelfHealLadder:
     """Phase 18c — ComputeNode._verify_and_heal_session."""
@@ -311,6 +327,49 @@ class TestSelfHealLadder:
         assert "did not start" in report[2]
         assert "sshd: boom" in report[2]
 
+    def test_exhausted_captures_logs_before_each_rung(self):
+        node = self._node()
+        h1 = SessionHandle(host_port=1, auth_token="t", container_id="c1", executor_type="docker")
+        h2 = SessionHandle(host_port=2, auth_token="t", container_id="c2", executor_type="docker")
+        h3 = SessionHandle(host_port=3, auth_token="t", container_id="c3", executor_type="docker")
+        executor = mock.MagicMock()
+        executor.start_session.side_effect = [h2, h3]
+        executor.container_logs.side_effect = ["log-from-c1", "", "log-from-c3"]
+        with (
+            mock.patch(
+                "computecloud_node.workbench_executor.probe_session_service",
+                return_value="dead",
+            ),
+            mock.patch("time.sleep"),
+        ):
+            result = node._verify_and_heal_session(executor, self._payload(), h1)
+        assert result is None
+        captured = [c.args[0] for c in executor.container_logs.call_args_list]
+        assert captured == [h1, h2, h3]
+        report = node._report_session_terminated.call_args[0]
+        assert "log-from-c3" in report[2]
+
+    def test_exhausted_empty_logs_never_reports_no_logs_available(self):
+        node = self._node()
+        h1 = SessionHandle(host_port=1, auth_token="t", container_id="c1", executor_type="docker")
+        h2 = SessionHandle(host_port=2, auth_token="t", container_id="c2", executor_type="docker")
+        h3 = SessionHandle(host_port=3, auth_token="t", container_id="c3", executor_type="docker")
+        executor = mock.MagicMock()
+        executor.start_session.side_effect = [h2, h3]
+        executor.container_logs.return_value = ""
+        with (
+            mock.patch(
+                "computecloud_node.workbench_executor.probe_session_service",
+                return_value="dead",
+            ),
+            mock.patch("time.sleep"),
+        ):
+            result = node._verify_and_heal_session(executor, self._payload(), h1)
+        assert result is None
+        report = node._report_session_terminated.call_args[0]
+        assert "No container logs available" not in report[2]
+        assert "Container logs were empty on every rung." in report[2]
+
 
 class TestEntrypointWrapping:
     """Phase 18d — startup scripts must not replace the image's entrypoint.
@@ -329,15 +388,15 @@ class TestEntrypointWrapping:
             "ssh_public_keys": keys,
         }
 
-    def test_ssh_with_keys_execs_image_entrypoint(self):
+    def test_ssh_with_keys_bare_image_and_post_start_injection(self):
         ex = DockerWorkbenchExecutor()
         with (
             mock.patch.object(
-                DockerWorkbenchExecutor, "_image_entrypoint", return_value=["/init"]
-            ),
-            mock.patch.object(
                 DockerWorkbenchExecutor, "_run_docker", return_value="cid123"
             ) as mock_run,
+            mock.patch.object(
+                DockerWorkbenchExecutor, "_run_startup_parts_docker"
+            ) as mock_parts,
             mock.patch(
                 "computecloud_node.workbench_executor._wait_for_port",
                 return_value=True,
@@ -346,10 +405,41 @@ class TestEntrypointWrapping:
             handle = ex.start_session(self._payload(["ssh-ed25519 AAAA test"]))
         assert handle.container_id == "cid123"
         docker_cmd = mock_run.call_args[0][0]
-        script = docker_cmd[docker_cmd.index("-c") + 1]
-        assert "authorized_keys" in script
-        assert "exec /init" in script
-        assert "tail -f /dev/null" not in script
+        # SSH image must run its OWN entrypoint: bare image, no /bin/sh -c wrap.
+        assert docker_cmd[-1] == "linuxserver/openssh-server:latest"
+        assert "-c" not in docker_cmd
+        mock_parts.assert_called_once()
+        parts = mock_parts.call_args[0][1]
+        assert any("authorized_keys" in p for p in parts)
+        assert any("ssh-ed25519 AAAA test" in p for p in parts)
+
+    def test_startup_parts_docker_exec(self):
+        ex = DockerWorkbenchExecutor()
+        with mock.patch(
+            "computecloud_node.workbench_executor.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0)
+            ex._run_startup_parts_docker("cid123", ["echo hi", "echo bye"])
+        cmd = mock_run.call_args[0][0]
+        assert "exec" in cmd and "cid123" in cmd
+        assert cmd[-1] == "echo hi && echo bye"
+
+    def test_startup_parts_docker_retries_then_warns(self):
+        ex = DockerWorkbenchExecutor()
+        with (
+            mock.patch(
+                "computecloud_node.workbench_executor.subprocess.run"
+            ) as mock_run,
+            mock.patch("time.sleep"),
+        ):
+            mock_run.return_value = mock.MagicMock(returncode=1, stderr="boom")
+            ex._run_startup_parts_docker("cid", ["x"])
+        assert mock_run.call_count == 3
+
+    def test_ssh_security_args_pool_user_lowercase_true(self):
+        args = DockerWorkbenchExecutor._ssh_security_args()
+        assert "USER_NAME=pool" in args and "USER_NAME=root" not in args
+        assert "PASSWORD_ACCESS=true" in args
 
     def test_ssh_without_keys_keeps_bare_image(self):
         ex = DockerWorkbenchExecutor()

@@ -131,7 +131,7 @@ def _docker_available() -> bool:
         result = subprocess.run(
             [docker_path, "info", "--format",
              "{{.ServerVersion}}"],
-            capture_output=True, text=True, timeout=10.0,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10.0,
         )
         return result.returncode == 0
     except Exception:
@@ -190,25 +190,34 @@ class DockerWorkbenchExecutor:
             ]
 
         startup_parts = self._build_startup_parts(session_data)
-        if startup_parts and not command:
-            # Phase 18d: command="" means "use the image's own entrypoint"
-            # (e.g. s6 /init on linuxserver images, which starts sshd).
-            # Wrapping startup parts in /bin/sh -c would REPLACE that
-            # entrypoint (container idles on `tail -f /dev/null`, no service
-            # ever starts).  Resolve the image's real entrypoint and exec it
-            # after the startup script instead.
-            entrypoint = self._image_entrypoint(docker_image)
-            if entrypoint:
-                import shlex as _shlex
+        run_parts_post_start = False
+        if session_type == "ssh" and not command:
+            # Phase 18e: the SSH image must run its OWN entrypoint — s6's
+            # /init starts sshd, and wrapping it in /bin/sh -c breaks the
+            # init (the container idles on `tail -f /dev/null` or dies in
+            # s6-overlay-suexec).  Startup parts (key injection, workspace
+            # sync, SDK install) run post-start via docker exec below.
+            docker_cmd.append(docker_image)
+            run_parts_post_start = bool(startup_parts)
+        else:
+            if startup_parts and not command:
+                # Phase 18d: command="" means "use the image's own
+                # entrypoint"; resolve it and exec it after the startup
+                # script instead of replacing it with tail -f.
+                entrypoint = self._image_entrypoint(docker_image)
+                if entrypoint:
+                    import shlex as _shlex
 
-                command = "exec " + _shlex.join(entrypoint)
-        docker_cmd += self._build_final_command(
-            docker_image, command, startup_parts,
-        )
+                    command = "exec " + _shlex.join(entrypoint)
+            docker_cmd += self._build_final_command(
+                docker_image, command, startup_parts,
+            )
         container_id = self._run_docker(docker_cmd)
         if not _wait_for_port(host_port, timeout=180.0):
             self._stop_container(container_id)
             raise WorkbenchExecutorError("Container port never opened")
+        if run_parts_post_start:
+            self._run_startup_parts_docker(container_id, startup_parts)
         return SessionHandle(
             host_port=host_port, auth_token=auth_token,
             container_id=container_id, executor_type="docker",
@@ -225,7 +234,7 @@ class DockerWorkbenchExecutor:
             result = subprocess.run(
                 [_find_docker(), "inspect", "-f",
                  "{{.State.Running}}", handle.container_id],
-                capture_output=True, text=True, timeout=5.0,
+                capture_output=True, encoding="utf-8", errors="replace", timeout=5.0,
             )
             return (result.returncode == 0
                     and result.stdout.strip() == "true")
@@ -238,7 +247,7 @@ class DockerWorkbenchExecutor:
         logger.info("Re-pulling image %s for session self-heal", image)
         subprocess.run(
             [_find_docker(), "pull", image],
-            capture_output=True, text=True, timeout=600.0,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=600.0,
         )
 
     def container_logs(self, handle: SessionHandle, tail: int = 40) -> str:
@@ -248,11 +257,40 @@ class DockerWorkbenchExecutor:
         try:
             result = subprocess.run(
                 [_find_docker(), "logs", "--tail", str(tail), handle.container_id],
-                capture_output=True, text=True, timeout=15.0,
+                capture_output=True, encoding="utf-8", errors="replace", timeout=15.0,
             )
             return (result.stdout + result.stderr).strip()[-2000:]
         except Exception:
             return ""
+
+    def _run_startup_parts_docker(
+        self, container_id: str, startup_parts: list[str]
+    ) -> None:
+        """Run startup script parts inside a booted container via docker exec.
+
+        Used for the SSH image, which must keep its own entrypoint (Phase
+        18e).  Retries a few times while s6 init settles; failures are logged
+        but non-fatal (the password fallback still works).
+        """
+        import time as _time
+
+        script = " && ".join(startup_parts)
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    [_find_docker(), "exec", container_id, "/bin/sh", "-c", script],
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=60.0,
+                )
+                if result.returncode == 0:
+                    return
+                logger.warning(
+                    "Startup parts failed (rc=%d, attempt %d/3): %s",
+                    result.returncode, attempt + 1, result.stderr.strip()[:200],
+                )
+            except Exception as exc:
+                logger.warning("Startup parts attempt %d/3 error: %s", attempt + 1, exc)
+            _time.sleep(2.0)
+        logger.warning("Startup parts never completed — session may miss keys/workspace")
 
     @staticmethod
     def _ssh_security_args() -> list[str]:
@@ -264,9 +302,14 @@ class DockerWorkbenchExecutor:
             "--cap-add", "CHOWN", "--cap-add", "FOWNER",
             "--cap-add", "KILL",
             "--cap-add", "NET_BIND_SERVICE",
-            "-e", "PASSWORD_ACCESS=TRUE",
+            # NOTE: lowercase "true" — the image checks [[ == "true" ]].
+            "-e", "PASSWORD_ACCESS=true",
             "-e", "USER_PASSWORD=poolpass",
-            "-e", "USER_NAME=root",
+            # Phase 18e: USER_NAME=pool (NOT root — the current image halts
+            # init with "USER_NAME cannot be set to an user that already
+            # exists" for existing users, and sshd never starts).  With
+            # PUID=0 the pool user is uid 0 inside the sandbox anyway.
+            "-e", "USER_NAME=pool",
             "-e", "PUID=0", "-e", "PGID=0",
         ]
 
@@ -283,12 +326,15 @@ class DockerWorkbenchExecutor:
 
         if not (ws or pool_env):
             if stype == "ssh" and ssh_keys:
+                # printf '%s\n' prints each arg on its own line (with trailing
+                # newline) — the old "\\\\n".join glued keys together.
+                keys_blob = " ".join("'" + k.strip() + "'" for k in ssh_keys if k.strip())
                 parts.append(
                     "mkdir -p /config/.ssh"
-                    " && printf '"
-                    + "\\\\n".join(ssh_keys)
-                    + "' >> /config/.ssh/authorized_keys"
+                    f" && printf '%s\\n' {keys_blob}"
+                    " >> /config/.ssh/authorized_keys"
                     " && chmod 700 /config/.ssh"
+                    " && chmod 600 /config/.ssh/authorized_keys"
                     " 2>/dev/null || true"
                 )
             return parts
@@ -348,12 +394,13 @@ class DockerWorkbenchExecutor:
                 pass
 
         if stype == "ssh" and ssh_keys:
+            keys_blob = " ".join("'" + k.strip() + "'" for k in ssh_keys if k.strip())
             parts.append(
                 "mkdir -p /config/.ssh"
-                " && printf '"
-                + "\\\\n".join(ssh_keys)
-                + "' >> /config/.ssh/authorized_keys"
+                f" && printf '%s\\n' {keys_blob}"
+                " >> /config/.ssh/authorized_keys"
                 " && chmod 700 /config/.ssh"
+                " && chmod 600 /config/.ssh/authorized_keys"
                 " 2>/dev/null || true"
             )
         return parts
@@ -371,7 +418,7 @@ class DockerWorkbenchExecutor:
             result = subprocess.run(
                 [_find_docker(), "image", "inspect", "--format",
                  "{{json .Config}}", image],
-                capture_output=True, text=True, timeout=30.0,
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30.0,
             )
             if result.returncode != 0:
                 return []
@@ -408,7 +455,7 @@ class DockerWorkbenchExecutor:
         try:
             result = subprocess.run(
                 docker_cmd, capture_output=True,
-                text=True, timeout=120.0,
+                encoding="utf-8", errors="replace", timeout=120.0,
             )
             if result.returncode != 0:
                 raise WorkbenchExecutorError(
@@ -434,7 +481,7 @@ class DockerWorkbenchExecutor:
             try:
                 subprocess.run(
                     args, capture_output=True,
-                    text=True, timeout=10.0,
+                    encoding="utf-8", errors="replace", timeout=10.0,
                 )
             except Exception:
                 pass

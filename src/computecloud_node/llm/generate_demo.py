@@ -26,6 +26,7 @@ import tempfile
 def _build_tiny_model():
     """Build a tiny randomly-initialised Llama model + save weights + config."""
     import torch  # lazy
+
     from computecloud_node.llm.model_shard import TorchShardModule
 
     config = {
@@ -65,9 +66,10 @@ def main():
     print("=" * 64)
 
     import torch  # lazy
+
     from computecloud_node.llm.executor import LLMShardExecutor
     from computecloud_node.llm.model_shard import TorchShardModule
-    from computecloud_node.llm.tokenizer import build_tiny_tokenizer, LLMTokenizer
+    from computecloud_node.llm.tokenizer import LLMTokenizer, build_tiny_tokenizer
     from computecloud_node.llm.weights import LocalWeightsSource, ShardWeightsLoader
 
     tok_path = os.path.join(tempfile.mkdtemp(), "tokenizer.json")
@@ -80,7 +82,7 @@ def main():
 
     weights_dir = _save_to_dir(config, state_dict, tok_path)
     weights_uri = f"file://{weights_dir}"
-    print(f"3. Saved weights to temp dir")
+    print("3. Saved weights to temp dir")
 
     n_tokens = 8
     prompt = "hello world"
@@ -96,7 +98,7 @@ def main():
             out = monolithic.forward(cur)
             mono_tokens.append(int(out[0, -1, :].argmax().item()))
             cur = torch.cat([cur, torch.tensor([mono_tokens[-1]])])
-    print(f"\n5. Monolithic full-recompute greedy:")
+    print("\n5. Monolithic full-recompute greedy:")
     print(f"   tokens: {mono_tokens}")
 
     # ── (a) Sharded pipeline with KV cache ──
@@ -110,7 +112,7 @@ def main():
     rid = "demo-run"
     sharded_tokens = []
     full = list(full_ids)
-    print(f"\n6. Sharded pipeline with KV cache (2 shards):")
+    print("\n6. Sharded pipeline with KV cache (2 shards):")
     for p in range(n_tokens):
         if p == 0:
             s0_payload = {
@@ -145,13 +147,13 @@ def main():
         full.append(t)
         print(f"   pass {p}: token_id={t}  (text={s1_out.get('token', '')!r})")
 
-    print(f"\n7. Correctness proof:")
+    print("\n7. Correctness proof:")
     print(f"   monolithic: {mono_tokens}")
     print(f"   sharded:    {sharded_tokens}")
     if mono_tokens == sharded_tokens:
-        print(f"   PASS — token sequences match!")
+        print("   PASS — token sequences match!")
     else:
-        print(f"   FAIL — sequences differ!")
+        print("   FAIL — sequences differ!")
         sys.exit(1)
 
     executor.evict_run_id(rid)

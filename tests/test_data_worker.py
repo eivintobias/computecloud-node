@@ -135,7 +135,11 @@ class TestDataShardAwareExecutor:
         client = _MockClient(data="x")
         worker = DataShardWorker(client, poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
         adapter = DataShardAwareExecutor(worker)
-        result = adapter.execute("t1", "j1", {"kind": DATA_SHARD_KIND, "data_run_id": "r", "shard_index": 0, "shard_count": 1, "topology": "parallel", "shard_spec": {}, "workload_type": "rendering"})
+        result = adapter.execute("t1", "j1", {
+            "kind": DATA_SHARD_KIND, "data_run_id": "r", "shard_index": 0,
+            "shard_count": 1, "topology": "parallel", "shard_spec": {},
+            "workload_type": "rendering",
+        })
         assert result is not None
         assert result["output"] == "x"
 
@@ -153,7 +157,9 @@ class TestDataShardAwareExecutor:
 
         client = _PipeMockClient()
         data_worker = DataShardWorker(client, poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
-        pipe_worker = PipelineShardWorker(client, poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
+        pipe_worker = PipelineShardWorker(
+            client, poll_interval_seconds=0.001, poll_timeout_seconds=2.0
+        )
         adapter = DataShardAwareExecutor(data_worker, pipeline_worker=pipe_worker)
         result = adapter.execute("t1", "j1", {
             "kind": "pipeline_shard", "pipeline_run_id": "r",
@@ -186,4 +192,7 @@ class TestDataShardAwareExecutor:
         worker = DataShardWorker(client, poll_interval_seconds=0.001, poll_timeout_seconds=2.0)
         adapter = DataShardAwareExecutor(worker)
         with pytest.raises(ValueError, match="no pipeline worker"):
-            adapter.execute("t1", "j1", {"kind": "pipeline_shard", "pipeline_run_id": "r", "shard_index": 0, "shard_count": 1, "shard_spec": {}})
+            adapter.execute("t1", "j1", {
+                "kind": "pipeline_shard", "pipeline_run_id": "r",
+                "shard_index": 0, "shard_count": 1, "shard_spec": {},
+            })

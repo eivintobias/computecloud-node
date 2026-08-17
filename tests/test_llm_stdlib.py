@@ -142,7 +142,7 @@ class TestRoutingPredicatesStdlib:
         assert not is_llm_shard_task({"kind": "llm_shard", "weights_uri": "http://x"})
 
     def test_is_data_shard_task(self):
-        from computecloud_node.data_worker import is_data_shard_task, DATA_SHARD_KIND
+        from computecloud_node.data_worker import DATA_SHARD_KIND, is_data_shard_task
         assert is_data_shard_task({"kind": DATA_SHARD_KIND})
         assert not is_data_shard_task({"kind": "llm_shard"})
         assert not is_data_shard_task(None)
@@ -163,8 +163,8 @@ class TestPackageExportsStdlib:
             assert name in computecloud_node.__all__, f"{name} missing from __all__"
 
     def test_individual_modules_importable(self):
-        import computecloud_node.tensor_format  # noqa: F401
         import computecloud_node.hf_uri  # noqa: F401
+        import computecloud_node.llm.executor  # noqa: F401
         import computecloud_node.llm.uri  # noqa: F401
         import computecloud_node.llm.weights  # noqa: F401
-        import computecloud_node.llm.executor  # noqa: F401
+        import computecloud_node.tensor_format  # noqa: F401
